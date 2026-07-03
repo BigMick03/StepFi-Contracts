@@ -157,7 +157,7 @@ Browse open issues: [StepFi-app/StepFi-Contracts/issues](https://github.com/Step
   <a href="https://github.com/EmeditWeb">
     <img src="https://avatars.githubusercontent.com/u/77761768?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="EmeditWeb"/><br />
     <sub><b>🥇 @EmeditWeb</b></sub><br />
-    <sub>24 contributions</sub>
+    <sub>25 contributions</sub>
   </a>
 </td>
 
