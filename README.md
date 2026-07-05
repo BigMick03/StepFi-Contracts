@@ -162,17 +162,17 @@ Browse open issues: [StepFi-app/StepFi-Contracts/issues](https://github.com/Step
 </td>
 
 <td align="center">
-  <a href="https://github.com/Dopezapha">
-    <img src="https://avatars.githubusercontent.com/u/141345379?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="Dopezapha"/><br />
-    <sub><b>🥈 @Dopezapha</b></sub><br />
-    <sub>3 contributions</sub>
+  <a href="https://github.com/actions-user">
+    <img src="https://avatars.githubusercontent.com/u/65916846?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="actions-user"/><br />
+    <sub><b>🥈 @actions-user</b></sub><br />
+    <sub>4 contributions</sub>
   </a>
 </td>
 
 <td align="center">
-  <a href="https://github.com/actions-user">
-    <img src="https://avatars.githubusercontent.com/u/65916846?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="actions-user"/><br />
-    <sub><b>🥉 @actions-user</b></sub><br />
+  <a href="https://github.com/Dopezapha">
+    <img src="https://avatars.githubusercontent.com/u/141345379?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="Dopezapha"/><br />
+    <sub><b>🥉 @Dopezapha</b></sub><br />
     <sub>3 contributions</sub>
   </a>
 </td>
