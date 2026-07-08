@@ -165,7 +165,7 @@ Browse open issues: [StepFi-app/StepFi-Contracts/issues](https://github.com/Step
   <a href="https://github.com/actions-user">
     <img src="https://avatars.githubusercontent.com/u/65916846?v=4" width="100" height="100" style="object-fit:cover;border-radius:50%;" alt="actions-user"/><br />
     <sub><b>🥈 @actions-user</b></sub><br />
-    <sub>6 contributions</sub>
+    <sub>7 contributions</sub>
   </a>
 </td>
 
