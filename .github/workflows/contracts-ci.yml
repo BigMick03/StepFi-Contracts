@@ -36,21 +36,21 @@ jobs:
       # creditline compiles. Build them individually first.
       - name: Build dependency WASMs first
         run: |
-          cargo build --target wasm32-unknown-unknown --release \
+          cargo build --locked --target wasm32-unknown-unknown --release \
             -p liquidity-pool-contract
-          cargo build --target wasm32-unknown-unknown --release \
+          cargo build --locked --target wasm32-unknown-unknown --release \
             -p vendor-registry-contract
-          cargo build --target wasm32-unknown-unknown --release \
+          cargo build --locked --target wasm32-unknown-unknown --release \
             -p reputation-contract
-          cargo build --target wasm32-unknown-unknown --release \
+          cargo build --locked --target wasm32-unknown-unknown --release \
             -p parameters-contract
 
       - name: Build all contracts
         run: |
-          cargo build --target wasm32-unknown-unknown --release
+          cargo build --locked --target wasm32-unknown-unknown --release
 
       - name: Run tests
         run: |
-          cargo test --manifest-path \
+          cargo test --locked --manifest-path \
             contracts/creditline-contract/Cargo.toml \
             2>&1
