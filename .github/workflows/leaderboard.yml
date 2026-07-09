@@ -1,8 +1,6 @@
 name: Update Leaderboard
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # everyday
   workflow_dispatch:
 
 permissions:
@@ -58,5 +56,8 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add README.md
-          git commit -m "update leaderboard" || echo "No changes"
+          git diff --cached --quiet && \
+            echo "No leaderboard changes" && \
+            exit 0
+          git commit -m "chore: update contributor leaderboard"
           git push
