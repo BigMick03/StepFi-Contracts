@@ -109,7 +109,7 @@ Update this file after every completed contract change, fix, or architectural de
 
 1. **Learner grace period** — Make `grace_period_seconds` per-loan (not just global via parameters)
 2. **Reputation rules** — Update `creditline-contract` to call different reputation adjustments for `LoanType::LearnerInstallment`
-3. **Testnet deployment** — Deploy all contracts, capture IDs, add to StepFi-API `.env`
+3. **Testnet deployment** ✅ — All 5 contracts deployed and initialized (see Contract Deployment Status below); IDs in StepFi-API env config
 4. **End-to-end validation** — Verify loan lifecycle on testnet via Stellar CLI
 
 ---
@@ -135,13 +135,25 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Contract Deployment Status
 
+All 5 contracts are deployed, initialized, and active on Stellar testnet
+(matches `README.md` and StepFi-Web `VERIFICATION.md`). These are the IDs
+live clients (StepFi-Web `constants/config.ts`) point at:
+
 | Contract | Testnet Deployed | Contract ID | Last Deployed |
 |---|---|---|---|
-| `reputation-contract` | ❌ No | — | — |
-| `parameters-contract` | ❌ No | — | — |
-| `vendor-registry-contract` | ❌ No | — | — |
-| `liquidity-pool-contract` | ❌ No | — | — |
-| `creditline-contract` | ❌ No | — | — |
+| `reputation-contract` | ✅ Yes | `CC3BO57ZRJGA63QJBIBSOMI25Z3X2I5CYTARYRAUXUAILX6L3OWBL5SB` | 2026-05-11 |
+| `parameters-contract` | ✅ Yes | `CCAE72SKYX55C5L56DBEFIMFVXRUIJY6JYLBREHEWRFNOW7AX5NBIJ5B` | 2026-05-11 |
+| `vendor-registry-contract` | ✅ Yes | `CCZ6T6NYCDNI26VGTPXKKWQDR7JCIZZ24LCEG4MMYHZJAG6BPWIVAU2L` | 2026-05-11 |
+| `liquidity-pool-contract` | ✅ Yes | `CACKE7ML2BTOAGQTAAW5NEARHCFX4PXXKGEO6GMU6NHFBVYQFZRJS2BT` | 2026-05-11 |
+| `creditline-contract` | ✅ Yes | `CAQDHYG3TALPNXG466SZUMJEPOI7VYV732LPFF3GHE4ASPBCNMIQBS3X` | 2026-05-12 (redeployed) |
+
+Deployer: `GCOYDYSEHRCFWGXUCMPSQ3ODEY2LGMBSVKKCOFH4NRIK4DEEDSETH7BF`
+
+> ⚠️ Known discrepancy: `contracts/deployed-testnet.json` records a
+> **second** full deployment on 2026-06-23 (deployer `GDL63O...Q4LH`)
+> with different contract IDs. Live clients still reference the
+> 2026-05-11 set above. Resolve which deployment is canonical and
+> update clients or this table accordingly.
 
 > Update this table after running `scripts/deploy-testnet.sh`
 
