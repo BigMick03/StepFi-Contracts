@@ -149,11 +149,23 @@ live clients (StepFi-Web `constants/config.ts`) point at:
 
 Deployer: `GCOYDYSEHRCFWGXUCMPSQ3ODEY2LGMBSVKKCOFH4NRIK4DEEDSETH7BF`
 
-> ⚠️ Known discrepancy: `contracts/deployed-testnet.json` records a
-> **second** full deployment on 2026-06-23 (deployer `GDL63O...Q4LH`)
-> with different contract IDs. Live clients still reference the
-> 2026-05-11 set above. Resolve which deployment is canonical and
-> update clients or this table accordingly.
+> ✅ Resolved 2026-07-17: The 2026-05-11 set above (deployer `GCOYDYSE...H7BF`,
+> = `stepfi-deployer` on the maintainer machine) is confirmed **live and correct**.
+> A reproducible `stellar contract build` of current `main` (multi-sig admin
+> included, commit `44a8c00`) produces bytecode whose SHA256 hashes match the
+> on-chain wasm of all five contracts above exactly — the contracts were created
+> in May and upgraded in place via their `upgrade()` functions as the source
+> evolved. All clients (web, landing, docs, live API `.well-known/stellar.toml`)
+> reference this set.
+>
+> The **second** deployment recorded on 2026-06-23 (deployer `GDL63O...Q4LH`) is
+> identified as an **orphaned experimental deploy**: its key is not recognized on
+> the maintainer machine, appears in no deploy script/env/shell-history, its
+> account was funded by testnet Friendbot immediately before deploy (no memo), and
+> its on-chain wasm matches no build of any branch in this repo. No client ever
+> referenced it. It is now recorded under `orphanedDeployment` in
+> `deployed-testnet.json` and marked DO NOT USE. Investigation into the origin of
+> the `GDL63O...` key is **ongoing**.
 
 > Update this table after running `scripts/deploy-testnet.sh`
 

@@ -1,41 +1,63 @@
 {
   "network": "testnet",
-  "deployer": "GDL63O24NKGJLMYATWX7NDZSQZ2FIGJEFDGDHXX72FJOWXLYPZBJQ4LH",
-  "deployedAt": "2026-06-23",
+  "deployer": "GCOYDYSEHRCFWGXUCMPSQ3ODEY2LGMBSVKKCOFH4NRIK4DEEDSETH7BF",
+  "deployedAt": "2026-05-11",
+  "lastVerifiedAt": "2026-07-17",
+  "note": "This is the canonical, live deployment (Set A). Contracts were created 2026-05-11/12 at stable addresses and upgraded in place via their upgrade() functions as the source evolved; their current on-chain wasm hashes match a reproducible `stellar contract build` of the current main branch (multi-sig admin included). All clients (StepFi-Web constants/config.ts, stepfi-landing, StepFi-Docs, and the live API .well-known/stellar.toml) reference these IDs. See orphanedDeployment below for the abandoned 2026-06-23 set.",
   "token": {
     "asset": "native",
     "sac": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
   },
   "contracts": {
     "parameters": {
-      "id": "CCC4PHTG6QYSOIE5Z2UAWXYC54YK4CVJFG47YH5GIMHD7FUB5QODABCB",
+      "id": "CCAE72SKYX55C5L56DBEFIMFVXRUIJY6JYLBREHEWRFNOW7AX5NBIJ5B",
       "initialized": true,
-      "initializedAt": "2026-06-23",
-      "initMethod": "initialize_defaults(admin)"
+      "initializedAt": "2026-05-11",
+      "initMethod": "initialize_defaults(admin)",
+      "wasmHash": "25cd88d4a48b706a59d7eae5c45a592b844048dc3428c24f3a8c7a420057b785"
     },
     "reputation": {
-      "id": "CAC7P36ULDLJMZ2RFEGOHGFFMU6NF5MRP5SQTWDFD2K7EIE2TBHHCQQT",
+      "id": "CC3BO57ZRJGA63QJBIBSOMI25Z3X2I5CYTARYRAUXUAILX6L3OWBL5SB",
       "initialized": true,
-      "initializedAt": "2026-06-23",
-      "initMethod": "set_admin(new_admin)"
+      "initializedAt": "2026-05-11",
+      "initMethod": "set_admin(new_admin)",
+      "wasmHash": "548ad3c1e0bca85a7adccb883879ed02e6bf93970d8af06ac8506d487a115da4"
     },
     "vendorRegistry": {
-      "id": "CAFCOBKMXYTNI2AT264QRWZNU7QL3DBL76JCQ5HQEP43QMY3YGKBCOJN",
+      "id": "CCZ6T6NYCDNI26VGTPXKKWQDR7JCIZZ24LCEG4MMYHZJAG6BPWIVAU2L",
       "initialized": true,
-      "initializedAt": "2026-06-23",
-      "initMethod": "initialize(admin)"
+      "initializedAt": "2026-05-11",
+      "initMethod": "initialize(admin)",
+      "wasmHash": "b973d07391e2cd4834370ba596873a3cd34dc7e39c7f059eaca321f597d9ada2"
     },
     "liquidityPool": {
-      "id": "CD6ZBJLU2REDN5VS6LJHY2TGZHTJHD7KSQEGSAOPYHW6UKHLM4BQZHIJ",
+      "id": "CACKE7ML2BTOAGQTAAW5NEARHCFX4PXXKGEO6GMU6NHFBVYQFZRJS2BT",
       "initialized": true,
-      "initializedAt": "2026-06-23",
-      "initMethod": "initialize(token, treasury, admin, merchant_fund)"
+      "initializedAt": "2026-05-11",
+      "initMethod": "initialize(token, treasury, admin, merchant_fund)",
+      "wasmHash": "5cccbfb7dd2a723110fb299c84636b25d7a437c07092a943b5e4d76f141adf38"
     },
     "creditline": {
-      "id": "CDFACCFOC7NVBRN5S476473YZXYC6MTECISBM6J2YIM74IOZ4K74TYJP",
+      "id": "CAQDHYG3TALPNXG466SZUMJEPOI7VYV732LPFF3GHE4ASPBCNMIQBS3X",
       "initialized": true,
-      "initializedAt": "2026-06-23",
-      "initMethod": "initialize(vendor_registry, liquidity_pool, reputation_contract, token, admin)"
+      "initializedAt": "2026-05-12",
+      "initMethod": "initialize(vendor_registry, liquidity_pool, reputation_contract, token, admin)",
+      "previousId": "CCWFD2J2NQS56HFNPG2S4HUR2LBA3O7NDQCB35C5JD7EBQUZ63G3LBCP",
+      "wasmHash": "392ad2562e8836a2836695bb4ed32973bde100b243b5f695ddf2698464541c9e"
+    }
+  },
+  "orphanedDeployment": {
+    "status": "abandoned",
+    "identifiedAt": "2026-07-17",
+    "deployer": "GDL63O24NKGJLMYATWX7NDZSQZ2FIGJEFDGDHXX72FJOWXLYPZBJQ4LH",
+    "deployedAt": "2026-06-23",
+    "reason": "DO NOT USE. A second full deployment made on 2026-06-23 from an unrecognized deployer key (not stepfi-deployer / GCOYDYSE... on the maintainer machine; funded by testnet Friendbot immediately before deploy, no memo, origin not traceable). Its on-chain wasm hashes match no build of any branch in this repo, and no client (web, landing, docs, live API) ever referenced these IDs. This block previously overwrote the canonical Set A record and caused a documentation discrepancy. Retained here only to prevent these IDs from being mistaken for live contracts. Investigation into the GDL63O... key origin is ongoing.",
+    "contracts": {
+      "parameters": "CCC4PHTG6QYSOIE5Z2UAWXYC54YK4CVJFG47YH5GIMHD7FUB5QODABCB",
+      "reputation": "CAC7P36ULDLJMZ2RFEGOHGFFMU6NF5MRP5SQTWDFD2K7EIE2TBHHCQQT",
+      "vendorRegistry": "CAFCOBKMXYTNI2AT264QRWZNU7QL3DBL76JCQ5HQEP43QMY3YGKBCOJN",
+      "liquidityPool": "CD6ZBJLU2REDN5VS6LJHY2TGZHTJHD7KSQEGSAOPYHW6UKHLM4BQZHIJ",
+      "creditline": "CDFACCFOC7NVBRN5S476473YZXYC6MTECISBM6J2YIM74IOZ4K74TYJP"
     }
   }
 }
