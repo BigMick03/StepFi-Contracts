@@ -577,7 +577,7 @@ fn test_interest_rounding_remainder_goes_to_lp() {
 // ─── receive_guarantee ────────────────────────────────────────────────────────
 
 #[test]
-fn test_receive_guarantee_reduces_locked_and_recovers_liquidity() {
+fn test_liquidate_funds_reduces_locked_and_recovers_liquidity() {
     let t = TestEnv::setup();
     let provider = Address::generate(&t.env);
     let merchant = Address::generate(&t.env);
@@ -587,18 +587,15 @@ fn test_receive_guarantee_reduces_locked_and_recovers_liquidity() {
     // Fund a 500-token loan
     t.client.fund_loan(&t.creditline, &merchant, &500);
 
-    // Default: guarantee of 100 returned
+    // Default: guarantee of 100 returned, 500 principal lost
     t.mint(&t.creditline, 100);
-    t.client.receive_guarantee(&t.creditline, &100);
+    t.client.liquidate_funds(&t.creditline, &500, &100);
 
     let stats = t.client.get_pool_stats();
-    // locked was 500, reduced by 100 → 400
-    assert_eq!(stats.locked_liquidity, 400);
-    // total_liquidity was 1000, recovered 100 → 1100... no wait:
-    // fund_loan doesn't change total_liquidity, it changes locked.
-    // After fund_loan: total=1000, locked=500, available=500.
-    // receive_guarantee adds 100 to total, reduces locked by 100.
-    assert_eq!(stats.total_liquidity, 1_100);
+    // locked was 500, reduced by 500 lost principal -> 0
+    assert_eq!(stats.locked_liquidity, 0);
+    // total_liquidity was 1000, reduced by 500 (lost) + 100 (recovered) -> 600
+    assert_eq!(stats.total_liquidity, 600);
 }
 
 // ─── withdraw (additional edge cases) ────────────────────────────────────────
@@ -1644,9 +1641,9 @@ fn test_guarantee_receipt_on_default() {
     let expected_available_after_loan = 5000;
     let expected_total_liquidity_after_loan = 10000;
     let guarantee_amount = 3000;
-    let expected_locked_after_guarantee = 2000;
-    let expected_total_liquidity_after_guarantee = 13000;
-    let expected_share_price_after_guarantee = 13000;
+    let expected_locked_after_guarantee = 0;
+    let expected_total_liquidity_after_guarantee = 8000;
+    let expected_share_price_after_guarantee = 8000;
 
     // 1. Provider deposits tokens
     let provider = Address::generate(&context.env);
@@ -1681,7 +1678,7 @@ fn test_guarantee_receipt_on_default() {
     context.mint(&context.creditline, guarantee_amount);
     context
         .client
-        .receive_guarantee(&context.creditline, &guarantee_amount);
+        .liquidate_funds(&context.creditline, &loan_amount, &guarantee_amount);
 
     // 4. Verify locked_liquidity reduced by guarantee amount
     let after_guarantee_stats = context.client.get_pool_stats();
@@ -2179,17 +2176,16 @@ fn test_receive_repayment_unauthorized_caller_fails() {
 // ─── receive_guarantee Edge Cases ────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Error(Contract, #4)")]
-fn test_receive_guarantee_with_zero_amount_fails() {
+fn test_liquidate_funds_allows_zero_amounts() {
     let t = TestEnv::setup();
-    t.client.receive_guarantee(&t.creditline, &0);
+    t.client.liquidate_funds(&t.creditline, &0, &0);
 }
 
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_receive_guarantee_negative_amount_fails() {
     let t = TestEnv::setup();
-    t.client.receive_guarantee(&t.creditline, &-100);
+    t.client.liquidate_funds(&t.creditline, &-100, &-100);
 }
 
 #[test]
@@ -2197,7 +2193,7 @@ fn test_receive_guarantee_negative_amount_fails() {
 fn test_receive_guarantee_unauthorized_caller_fails() {
     let t = TestEnv::setup();
     let intruder = Address::generate(&t.env);
-    t.client.receive_guarantee(&intruder, &100);
+    t.client.liquidate_funds(&intruder, &100, &100);
 }
 
 #[test]
@@ -2212,15 +2208,14 @@ fn test_receive_guarantee_exceeds_locked_liquidity() {
     t.client.fund_loan(&t.creditline, &merchant, &500);
 
     // Receive guarantee of 600 (more than locked 500)
-    // The contract should cap recovery at locked amount (500)
     t.mint(&t.creditline, 600);
-    t.client.receive_guarantee(&t.creditline, &600);
+    t.client.liquidate_funds(&t.creditline, &500, &600);
 
     let stats = t.client.get_pool_stats();
     // Locked should be reduced to 0 (capped at 500)
     assert_eq!(stats.locked_liquidity, 0);
-    // Total liquidity should increase by only 500 (not 600)
-    assert_eq!(stats.total_liquidity, 1_500);
+    // Total liquidity goes from 1000 -> 1000 - 500 + 600 = 1100
+    assert_eq!(stats.total_liquidity, 1_100);
 }
 
 // ─── fund_loan Edge Cases ────────────────────────────────────────────────────
@@ -2293,19 +2288,19 @@ fn test_partial_guarantee_recovery_multiple_defaults() {
 
     // First default with partial guarantee
     t.mint(&t.creditline, 1_000);
-    t.client.receive_guarantee(&t.creditline, &1_000);
+    t.client.liquidate_funds(&t.creditline, &3_000, &1_000);
 
     let stats_after_first = t.client.get_pool_stats();
-    assert_eq!(stats_after_first.locked_liquidity, 4_000); // 5000 - 1000
-    assert_eq!(stats_after_first.total_liquidity, 11_000); // 10000 + 1000
+    assert_eq!(stats_after_first.locked_liquidity, 2_000); // 5000 - 3000
+    assert_eq!(stats_after_first.total_liquidity, 8_000); // 10000 - 3000 + 1000
 
     // Second default with partial guarantee
     t.mint(&t.creditline, 800);
-    t.client.receive_guarantee(&t.creditline, &800);
+    t.client.liquidate_funds(&t.creditline, &2_000, &800);
 
     let stats_after_second = t.client.get_pool_stats();
-    assert_eq!(stats_after_second.locked_liquidity, 3_200); // 4000 - 800
-    assert_eq!(stats_after_second.total_liquidity, 11_800); // 11000 + 800
+    assert_eq!(stats_after_second.locked_liquidity, 0); // 2000 - 2000
+    assert_eq!(stats_after_second.total_liquidity, 6_800); // 8000 - 2000 + 800
 }
 
 #[test]
@@ -2404,16 +2399,16 @@ fn test_loan_funding_and_guarantee_recovery_cycle() {
 
     // Partial guarantee recovery
     t.mint(&t.creditline, 500);
-    t.client.receive_guarantee(&t.creditline, &500);
+    t.client.liquidate_funds(&t.creditline, &2_000, &500);
 
     let stats_after_guarantee = t.client.get_pool_stats();
-    assert_eq!(stats_after_guarantee.locked_liquidity, 1_500);
-    assert_eq!(stats_after_guarantee.total_liquidity, 5_500);
+    assert_eq!(stats_after_guarantee.locked_liquidity, 0);
+    assert_eq!(stats_after_guarantee.total_liquidity, 3_500);
 
     // Fund another loan
     t.client.fund_loan(&t.creditline, &merchant, &1_000);
 
     let stats_final = t.client.get_pool_stats();
-    assert_eq!(stats_final.locked_liquidity, 2_500);
-    assert_eq!(stats_final.available_liquidity, 3_000);
+    assert_eq!(stats_final.locked_liquidity, 1_000);
+    assert_eq!(stats_final.available_liquidity, 2_500);
 }
