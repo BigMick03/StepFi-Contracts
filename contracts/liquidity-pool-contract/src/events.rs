@@ -4,7 +4,7 @@ const DEPOSITED: Symbol = symbol_short!("LQDEPST");
 const WITHDRAWN: Symbol = symbol_short!("LQWTHDR");
 const LOAN_FUNDED: Symbol = symbol_short!("LQFUND");
 const REPAYMENT_RCV: Symbol = symbol_short!("LQREPAY");
-const GUARANTEE_RCV: Symbol = symbol_short!("LQGUART");
+
 const INTEREST_DIST: Symbol = symbol_short!("LQINTDST");
 const LOSS_ABSORBED: Symbol = symbol_short!("LQLOSS");
 
@@ -36,9 +36,11 @@ pub fn emit_repayment_received(env: &Env, creditline: &Address, principal: i128,
         .publish((REPAYMENT_RCV, creditline), (principal, interest));
 }
 
-/// Emitted when a forfeited guarantee is received on loan default
-pub fn emit_guarantee_received(env: &Env, creditline: &Address, amount: i128) {
-    env.events().publish((GUARANTEE_RCV, creditline), amount);
+const FUNDS_LIQUIDATED: Symbol = symbol_short!("LQLIQUID");
+
+/// Emitted when funds are liquidated on loan default (lost principal and recovered guarantee)
+pub fn emit_funds_liquidated(env: &Env, creditline: &Address, lost_principal: i128, guarantee_amount: i128) {
+    env.events().publish((FUNDS_LIQUIDATED, creditline), (lost_principal, guarantee_amount));
 }
 
 /// Emitted when interest is distributed to LPs, treasury, and merchant fund

@@ -6,11 +6,13 @@ use soroban_sdk::{
 };
 
 mod liquidity_pool {
+    // Importing the liquidity pool contract WASM for cross-contract calls
     soroban_sdk::contractimport!(
         file = "../../target/wasm32-unknown-unknown/release/liquidity_pool_contract.wasm"
     );
 }
 mod vendor_registry {
+    // Importing the vendor registry contract WASM for cross-contract calls
     soroban_sdk::contractimport!(
         file = "../../target/wasm32-unknown-unknown/release/vendor_registry_contract.wasm"
     );
@@ -438,13 +440,28 @@ impl CreditLineContract {
         }
     }
 
-    fn calculate_default_penalty(env: &Env, loan: &Loan) -> u32 {
-        let params = Self::get_protocol_parameters(env);
-        if loan.total_amount > params.large_loan_threshold {
-            params.large_loan_default_penalty
-        } else {
-            params.default_penalty
+    pub fn can_default(env: Env, loan_id: u64) -> bool {
+        let loan = match storage::read_loan(&env, loan_id) {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        if loan.status != LoanStatus::Active {
+            return false;
         }
+        let last_installment = match loan.repayment_schedule.last() {
+            Some(i) => i,
+            None => return false,
+        };
+        let now = env.ledger().timestamp();
+        let params = Self::get_protocol_parameters(&env);
+        let grace_ends_at = match last_installment
+            .due_date
+            .checked_add(params.grace_period_seconds)
+        {
+            Some(t) => t,
+            None => return false,
+        };
+        now > grace_ends_at
     }
 
     /// Warn that a loan is past due but still within the grace period.
@@ -491,39 +508,15 @@ impl CreditLineContract {
         Ok(())
     }
 
-    pub fn mark_defaulted(env: Env, loan_id: u64) -> Result<(), CreditLineError> {
+    pub fn check_default(env: Env, loan_id: u64) -> Result<(), CreditLineError> {
         let mut loan = storage::read_loan(&env, loan_id)?;
 
         if loan.status != LoanStatus::Active {
             return Err(CreditLineError::LoanNotActive);
         }
 
-        let last_installment = loan
-            .repayment_schedule
-            .last()
-            .ok_or(CreditLineError::Overflow)?;
-
-        let now = env.ledger().timestamp();
-        if now <= last_installment.due_date {
+        if !Self::can_default(env.clone(), loan_id) {
             return Err(CreditLineError::LoanNotOverdue);
-        }
-
-        let params = Self::get_protocol_parameters(&env);
-        let grace_ends_at = last_installment
-            .due_date
-            .checked_add(params.grace_period_seconds)
-            .ok_or(CreditLineError::Overflow)?;
-
-        if now <= grace_ends_at {
-            // Still within the grace window — emit a warning and block hard default.
-            events::emit_loan_in_grace_period(
-                &env,
-                &loan.borrower,
-                loan_id,
-                loan.remaining_balance,
-                grace_ends_at,
-            );
-            return Err(CreditLineError::LoanInGracePeriod);
         }
 
         let lp_address =
@@ -540,7 +533,11 @@ impl CreditLineContract {
         Self::authorize_token_transfer(&env, &token_address, &lp_address, loan.guarantee_amount);
 
         let lp_client = LiquidityPoolContractClient::new(&env, &lp_address);
-        lp_client.receive_guarantee(&env.current_contract_address(), &loan.guarantee_amount);
+        lp_client.liquidate_funds(
+            &env.current_contract_address(),
+            &loan.principal_outstanding,
+            &loan.guarantee_amount,
+        );
 
         // Compute unrecovered principal shortfall and socialize the loss to the pool.
         let principal_shortfall = loan
@@ -561,7 +558,7 @@ impl CreditLineContract {
         );
 
         if let Some(reputation_contract) = storage::get_reputation_contract(&env)? {
-            let penalty = Self::calculate_default_penalty(&env, &loan);
+            let penalty: u32 = 30;
             let updater = env.current_contract_address();
             let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &reputation_contract,

@@ -299,41 +299,38 @@ impl LiquidityPoolContract {
         Ok(())
     }
 
-    /// Receive a forfeited guarantee on loan default.
-    /// The amount offsets the loss: it is added back to total_liquidity
-    /// and reduces locked_liquidity by the same amount (partial recovery).
-    pub fn receive_guarantee(
+    /// Liquidate a defaulted loan's funds.
+    /// The lost_principal reduces the pool's value, while the guarantee_amount offsets it.
+    pub fn liquidate_funds(
         env: Env,
         creditline: Address,
-        amount: i128,
+        lost_principal: i128,
+        guarantee_amount: i128,
     ) -> Result<(), LiquidityPoolError> {
         creditline.require_auth();
         Self::require_creditline(&env, &creditline);
 
-        if amount <= 0 {
+        if lost_principal < 0 || guarantee_amount < 0 {
             return Err(LiquidityPoolError::InvalidAmount);
         }
         Self::enter_non_reentrant(&env);
 
-        // The defaulted loan principal stays "locked" — the guarantee partially
-        // covers the loss.  We reduce locked_liquidity by the guarantee amount
-        // and add it back to total_liquidity (net pool recovers that portion).
-        let locked =
-            storage::get_locked_liquidity(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
-        let recovered = amount.min(locked); // can't recover more than locked
-        let new_locked = safe_math::sub_i128(locked, recovered)?;
+        let locked = storage::get_locked_liquidity(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
+        let new_locked = safe_math::sub_i128(locked, lost_principal.min(locked))?;
         storage::set_locked_liquidity(&env, new_locked);
 
-        let total_liquidity =
-            storage::get_total_liquidity(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
-        let new_total = safe_math::add_i128(total_liquidity, recovered)?;
+        let total_liquidity = storage::get_total_liquidity(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
+        let mut new_total = safe_math::sub_i128(total_liquidity, lost_principal)?;
+        new_total = safe_math::add_i128(new_total, guarantee_amount)?;
         storage::set_total_liquidity(&env, new_total);
 
-        let token = storage::get_token(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&creditline, &env.current_contract_address(), &amount);
+        if guarantee_amount > 0 {
+            let token = storage::get_token(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&creditline, &env.current_contract_address(), &guarantee_amount);
+        }
 
-        events::emit_guarantee_received(&env, &creditline, amount);
+        events::emit_funds_liquidated(&env, &creditline, lost_principal, guarantee_amount);
         Self::exit_non_reentrant(&env);
         Ok(())
     }
@@ -521,10 +518,11 @@ impl LiquidityPoolContract {
 
     /// Calculate how many tokens `shares` are worth at the current share price.
     pub fn calculate_withdrawal(env: Env, shares: i128) -> i128 {
-        let share_price = Self::calculate_share_price_internal(&env).unwrap_or(types::SHARE_PRICE_PRECISION);
-        if shares == 0 {
+        let total_shares = storage::get_total_shares(&env).unwrap_or(0);
+        if shares == 0 || total_shares == 0 {
             return 0;
         }
+        let share_price = Self::calculate_share_price_internal(&env).unwrap_or(types::SHARE_PRICE_PRECISION);
         safe_math::div_i128(
             safe_math::mul_i128(shares, share_price).unwrap_or(0),
             types::SHARE_PRICE_PRECISION,
