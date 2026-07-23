@@ -2176,6 +2176,26 @@ fn test_receive_repayment_unauthorized_caller_fails() {
     t.client.receive_repayment(&intruder, &100, &50);
 }
 
+#[test]
+fn test_receive_repayment_principal_exceeds_locked_floors_at_zero() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    // Fund a loan of 500
+    t.client.fund_loan(&t.creditline, &merchant, &500);
+
+    // Repay with 600 principal (exceeds locked 500)
+    t.mint(&t.creditline, 600);
+    t.client.receive_repayment(&t.creditline, &600, &0);
+
+    let stats = t.client.get_pool_stats();
+    // Locked should be floored to zero
+    assert_eq!(stats.locked_liquidity, 0);
+}
+
 // ─── receive_guarantee Edge Cases ────────────────────────────────────────────
 
 #[test]
