@@ -11,8 +11,10 @@ const LOAN_CANCELLED: Symbol = symbol_short!("LOANCNCL");
 const LOAN_LATE_FEE: Symbol = symbol_short!("LOANLTFE");
 const LOAN_GRACE_PERIOD: Symbol = symbol_short!("LOANGRC");
 const INSTALLMENT_PAID: Symbol = symbol_short!("INSTPAID");
+const VENDOR_PAID: Symbol = symbol_short!("VENDORPD");
 
 pub const LOANAPPROVED: &str = "LOANAPPROVED";
+pub const VENDOR_PAID_TOPIC: &str = "VENDORPD";
 
 pub fn emit_loan_approved(env: &Env, loan_id: u64) {
     let topics = (Symbol::new(env, LOANAPPROVED), loan_id);
@@ -161,5 +163,17 @@ pub fn emit_contract_upgraded(env: &Env, old_version: u32, new_version: u32) {
     env.events().publish(
         (Symbol::new(env, "CONTRACTUPGRADED"),),
         (old_version, new_version, env.ledger().timestamp()),
+    );
+}
+
+/// Emit a vendor-paid event after the loan's pool contribution has been transferred
+/// to the vendor.
+///
+/// Payload: `(vendor, paid_amount, env.ledger().timestamp())`.
+/// Topics:   `(VENDOR_PAID, loan_id, vendor)`.
+pub fn emit_vendor_paid(env: &Env, loan_id: u64, vendor: &Address, paid_amount: i128) {
+    env.events().publish(
+        (VENDOR_PAID, loan_id, vendor.clone()),
+        (paid_amount, env.ledger().timestamp()),
     );
 }

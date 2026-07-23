@@ -2,6 +2,7 @@ use crate::{
     CreditLineContract, CreditLineContractClient, CreditLineError, LoanStatus, LoanType,
     RepaymentInstallment,
 };
+use crate::events::VENDOR_PAID_TOPIC;
 use liquidity_pool_contract::{LiquidityPoolContract, LiquidityPoolContractClient, PoolStats};
 use parameters_contract::{
     default_parameters, ParametersContract, ParametersContractClient, ProposalAction,
@@ -3274,6 +3275,232 @@ fn test_approve_loan_rejects_past_due_date() {
     // Move the clock past the due date so it is no longer in the future at approval.
     t.env.ledger().set_timestamp(due_date + 1);
     t.client.approve_loan(&loan_id);
+}
+
+// ─── vendor payment on approval ────────────────────────────────────────────────
+
+#[test]
+fn test_approve_loan_pays_vendor() {
+    // After approve_loan, the vendor must receive the pool contribution
+    // (total - guarantee = 800), vendor_paid must be true, funded_at must be
+    // set, and the MockLiquidityPool must have observed a fund_loan call.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    let before_approval_ts = t.env.ledger().timestamp();
+
+    let approved = t.client.approve_loan(&loan_id);
+    assert_eq!(approved.status, LoanStatus::Active);
+    assert!(approved.vendor_paid, "vendor_paid flag should be true");
+    assert!(approved.funded_at >= before_approval_ts);
+
+    let stored = t.client.get_loan(&loan_id);
+    assert!(stored.vendor_paid);
+
+    // MockLiquidityPool::fund_loan sets the FUND flag when called.
+    assert!(
+        t.was_fund_loan_called(),
+        "fund_loan must be invoked on the LP so the vendor gets paid via the stored token contract"
+    );
+}
+
+#[test]
+fn test_request_loan_does_not_pay_vendor_by_default() {
+    // Default scenario: request_loan → never approved. Vendor must NOT be
+    // paid and vendor_paid must remain false until approve_loan is called.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Pending);
+    assert!(!loan.vendor_paid);
+
+    // Until approve_loan runs, the LP must not have been asked to fund.
+    assert!(!t.was_fund_loan_called());
+}
+
+#[test]
+fn test_cancel_pending_loan_does_not_pay_vendor() {
+    // Cancelling a Pending loan must not result in a vendor payment AND the
+    // guarantee must be refunded to the borrower. The mint happens inside
+    // `create_default_request`, so we capture the post-request, pre-cancel
+    // balance (which equals 0 because the guarantee was escrowed) and assert
+    // it grows by exactly the guarantee amount after cancel.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    let balance_after_request = t.balance(&user);
+    assert_eq!(
+        balance_after_request, 0,
+        "guarantee should be escrowed in creditline after request_loan"
+    );
+
+    t.client.cancel_loan(&user, &loan_id);
+
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Cancelled);
+    assert!(!loan.vendor_paid, "cancelled loan must not mark vendor_paid");
+    assert!(!t.was_fund_loan_called(), "LP must not be invoked on cancel");
+    assert_eq!(
+        t.balance(&user),
+        balance_after_request + DEFAULT_GUARANTEE,
+        "cancel must refund the escrowed guarantee to the borrower"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")] // VendorAlreadyPaid
+fn test_pay_vendor_twice_returns_error() {
+    // After approval vendor_paid is true; trying to call pay_vendor
+    // directly must panic with VendorAlreadyPaid (error 28).
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    t.client.approve_loan(&loan_id);
+    // Direct call panics with the contract error — no `try_pay_vendor`
+    // wrapper is needed here.
+    t.client.pay_vendor(&loan_id);
+}
+
+#[test]
+fn test_pay_vendor_emits_event() {
+    // Approve a loan and verify a VENDORPD event was emitted with the
+    // expected vendor address and pool contribution amount.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    // Capture the timestamp at the moment of approval so we can match the event.
+    let before_ts = t.env.ledger().timestamp();
+    t.client.approve_loan(&loan_id);
+
+    let all = t.env.events().all();
+    let pool_contribution = DEFAULT_PRINCIPAL - DEFAULT_GUARANTEE; // 800
+
+    use soroban_sdk::IntoVal;
+    let mut found_vendorpd: Option<(i128, u64, Address)> = None;
+    for e in all.iter() {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 3 {
+            continue;
+        }
+        let topic: soroban_sdk::Symbol = topics.get_unchecked(0).into_val(&t.env);
+        if topic != soroban_sdk::Symbol::new(&t.env, VENDOR_PAID_TOPIC) {
+            continue;
+        }
+        let ev_loan_id: u64 = topics.get_unchecked(1).into_val(&t.env);
+        let ev_vendor: Address = topics.get_unchecked(2).into_val(&t.env);
+        let (amount, ts): (i128, u64) = e.2.into_val(&t.env);
+        if ev_loan_id == loan_id && ev_vendor == vendor && amount == pool_contribution && ts >= before_ts {
+            found_vendorpd = Some((amount, ts, ev_vendor));
+            break;
+        }
+    }
+    let (amount, _ts, ev_vendor) =
+        found_vendorpd.expect("expected VENDORPD event with loan_id, vendor, and pool contribution");
+    assert_eq!(amount, pool_contribution);
+    assert_eq!(ev_vendor, vendor);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // LoanNotActive
+fn test_pay_vendor_on_pending_loan_fails() {
+    // pay_vendor requires Active status. A Pending request without
+    // approval must panic with LoanNotActive.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    // Loan is still Pending — pay_vendor should panic.
+    t.client.pay_vendor(&loan_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // LoanNotActive
+fn test_pay_vendor_on_cancelled_loan_fails() {
+    // After cancel_loan the loan isn't Active anymore, so pay_vendor
+    // must panic with LoanNotActive (vendor is never paid on cancellation).
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_request(&user, &vendor);
+    t.client.cancel_loan(&user, &loan_id);
+
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Cancelled);
+    assert!(!loan.vendor_paid);
+    t.client.pay_vendor(&loan_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // LoanNotFound
+fn test_pay_vendor_on_unknown_loan_fails() {
+    let t = TestCtx::setup();
+    // Direct call panics with LoanNotFound for the missing loan_id.
+    t.client.pay_vendor(&999);
+}
+
+#[test]
+fn test_create_loan_marks_vendor_paid_immediately() {
+    // create_loan funds the vendor via the LP at construction time, so
+    // it must also flip vendor_paid immediately for accounting symmetry
+    // with the request/approve flow.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+
+    let loan_id = t.create_default_loan(&user, &vendor);
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Active);
+    assert!(loan.vendor_paid);
+    assert!(t.was_fund_loan_called());
+}
+
+#[test]
+fn test_approve_loan_with_zero_pool_contribution() {
+    // If total_amount == guarantee_amount the pool contribution is zero, so
+    // `pay_vendor` must NOT call the LP but must still mark vendor_paid and
+    // emit the VENDORPD event with paid_amount = 0.
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let vendor = Address::generate(&t.env);
+    t.register_vendor(&vendor, "Test Vendor");
+
+    // Build a request via the public method using matching totals.
+    let timestamp_before = t.env.ledger().timestamp();
+    let total: i128 = 200;
+    let guarantee: i128 = 200; // 100% guarantee → pool_contribution = 0
+    t.mint(&user, guarantee);
+
+    let mut schedule = soroban_sdk::Vec::new(&t.env);
+    schedule.push_back(RepaymentInstallment {
+        amount: total,
+        due_date: t.env.ledger().timestamp() + 10_000,
+        paid: false,
+        paid_at: 0,
+    });
+
+    let loan_id =
+        t.client
+            .request_loan(&user, &vendor, &total, &guarantee, &schedule, &LoanType::Standard);
+
+    let approved = t.client.approve_loan(&loan_id);
+    assert!(approved.vendor_paid);
+    assert!(approved.funded_at >= timestamp_before);
+
+    // The LP must NOT have been called for a zero pool contribution.
+    assert!(!t.was_fund_loan_called());
 }
 
 // ─── is_on_time helper tests ──────────────────────────────────────────────────

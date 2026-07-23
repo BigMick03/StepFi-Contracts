@@ -71,6 +71,9 @@ pub struct Loan {
     pub funded_at: u64,                  // 0 means not funded yet
     pub late_fees_outstanding: i128,     // accumulated unpaid late fees
     pub late_fee_accrual_timestamp: u64, // last accrual timestamp (0 = never accrued)
+    pub vendor_paid: bool,               // true once the vendor has been funded the
+                                         // (total_amount - guarantee_amount) pool share of
+                                         // the loan via `pay_vendor`. Prevents double payment.
 }
 
 pub fn default_protocol_parameters() -> ProtocolParameters {

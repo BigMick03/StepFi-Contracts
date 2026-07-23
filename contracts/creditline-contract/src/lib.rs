@@ -98,15 +98,24 @@ impl CreditLineContract {
             LoanStatus::Active,
             loan_type,
         )?;
-        loan.funded_at = env.ledger().timestamp();
 
         storage::increase_user_active_debt(&env, &user, loan.remaining_balance)
             .unwrap_or_else(|err| panic_with_error!(&env, err));
         let loan_id = loan.loan_id;
+        // Persist with vendor_paid = false first — flip the flag only after a
+        // successful pool-funding call so a failed LP transfer does not leave
+        // the loan marked as paid.
         storage::write_loan(&env, &loan);
 
         let pool_contribution = safe_math::sub_i128(total_amount, guarantee_amount)?;
         Self::fund_loan_from_pool(&env, &user, &vendor, guarantee_amount, pool_contribution);
+
+        // `create_loan` funds the vendor directly via the liquidity pool,
+        // so mark the loan as already paid-out + funded to keep the
+        // vendor-side accounting consistent with the request/approve flow.
+        loan.vendor_paid = true;
+        loan.funded_at = env.ledger().timestamp();
+        storage::write_loan(&env, &loan);
 
         events::emit_loan_created(
             &env,
@@ -403,6 +412,7 @@ impl CreditLineContract {
             funded_at: 0,
             late_fees_outstanding: 0,
             late_fee_accrual_timestamp: 0,
+            vendor_paid: false,
         })
     }
 
@@ -598,7 +608,10 @@ impl CreditLineContract {
             }
         }
 
-        // 4. Transition to Active
+        // 4. Transition to Active. `funded_at` is intentionally left at 0
+        //    here — it is set inside `pay_vendor` only after a successful
+        //    funding call, preserving the invariant
+        //    `funded_at > 0 ⇔ vendor_paid` for downstream readers.
         loan.status = LoanStatus::Active;
 
         // 5. Write back with TTL extension
@@ -607,7 +620,75 @@ impl CreditLineContract {
         // 6. Emit event
         events::emit_loan_approved(&env, loan_id);
 
-        loan
+        // 7. Fund the vendor now that the loan is approved. `pay_vendor`
+        //    validates the loan status, the `vendor_paid` flag, and
+        //    forwards the pool contribution to the vendor via the
+        //    liquidity pool's `fund_loan` (which executes the underlying
+        //    token transfer with its stored token contract).
+        Self::pay_vendor(env.clone(), loan_id)
+            .unwrap_or_else(|err| panic_with_error!(&env, err));
+
+        // Re-read so the returned Loan reflects vendor_paid = true and the
+        // persisted funded_at timestamp.
+        storage::read_loan(&env, loan_id)
+            .unwrap_or_else(|err| panic_with_error!(&env, err))
+    }
+
+    /// Fund the vendor with the pool contribution (`total_amount - guarantee_amount`)
+    /// for an active loan and flip `vendor_paid` so the same loan cannot be paid twice.
+    ///
+    /// The actual token transfer is performed by the registered liquidity pool's
+    /// `fund_loan` entry point, which transfers from the pool's balance to the
+    /// vendor using the pool's stored token contract. This contract does not need
+    /// to call `token::transfer` itself or `authorize_as_current_contract`, because
+    /// the transfer originates from the pool.
+    ///
+    /// Errors:
+    /// * `LoanNotFound`     — `loan_id` does not exist.
+    /// * `LoanNotActive`    — the loan is not in `Active` status.
+    /// * `VendorAlreadyPaid` — the vendor has already been funded for this loan.
+    /// * `InsufficientLiquidity` — no liquidity pool is configured.
+    /// * `TokenNotConfigured`     — no token is configured.
+    pub fn pay_vendor(env: Env, loan_id: u64) -> Result<(), CreditLineError> {
+        let mut loan = storage::read_loan(&env, loan_id)?;
+
+        if loan.status != LoanStatus::Active {
+            return Err(CreditLineError::LoanNotActive);
+        }
+
+        if loan.vendor_paid {
+            return Err(CreditLineError::VendorAlreadyPaid);
+        }
+
+        // The actual token transfer is performed by the registered LP's
+        // `fund_loan`, which transfers from the pool's balance to the
+        // vendor using the LP's stored token contract — we don't need the
+        // creditline's stored token for this path.
+        let liquidity_pool =
+            storage::get_liquidity_pool(&env)?.ok_or(CreditLineError::InsufficientLiquidity)?;
+
+        let pool_contribution = safe_math::sub_i128(loan.total_amount, loan.guarantee_amount)?;
+
+        Self::enter_non_reentrant(&env);
+
+        if pool_contribution > 0 {
+            let lp_client = LiquidityPoolContractClient::new(&env, &liquidity_pool);
+            lp_client.fund_loan(&env.current_contract_address(), &loan.vendor, &pool_contribution);
+        }
+
+        // Flip both `vendor_paid` and `funded_at` together only after the LP
+        // funding call has returned successfully, so a failed LP call leaves
+        // the loan in a clean (still-unpaid, unfunded) state and a retry is
+        // possible. When the pool contribution is zero the LP isn't called
+        // and the loan is still marked paid — there's nothing to fund.
+        loan.vendor_paid = true;
+        loan.funded_at = env.ledger().timestamp();
+        storage::write_loan(&env, &loan);
+
+        events::emit_vendor_paid(&env, loan_id, &loan.vendor, pool_contribution);
+
+        Self::exit_non_reentrant(&env);
+        Ok(())
     }
 
     pub fn cancel_loan(env: Env, caller: Address, loan_id: u64) {
