@@ -115,6 +115,15 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Recently Fixed
 
+### Security: Unauthorized `distribute_interest` / `accumulate_interest` (SC-17)
+- **Problem:** `distribute_interest()` and `accumulate_interest()` were public mutating functions with no `require_auth()` and no caller restriction. Any funded account could call them with an arbitrary amount, draining the pool's token balance to treasury and merchant fund addresses and inflating the share price so the caller could redeem LP shares for more than deposited.
+- **Fix:** Changed both function signatures to accept `creditline: Address` as the first parameter. Added `creditline.require_auth()` as the literal first line and `Self::require_creditline(&env, &creditline)` as the second, matching `receive_repayment()` exactly. Both functions now pull `interest_amount` tokens into the pool via `token_client.transfer()` before any accounting change. Updated doc comments to remove the admin edge-case mention.
+- **Internal call site preserved:** `receive_repayment()` still calls `distribute_interest_internal()` directly — it has already pulled funds and validated the caller, so it must not go through the newly guarded public wrappers.
+- **Pre-existing bug fixed:** `calculate_withdrawal()` now returns 0 when the pool has no shares, fixing two pre-existing test failures.
+- **Files:** `contracts/liquidity-pool-contract/src/lib.rs`, `contracts/liquidity-pool-contract/src/tests.rs`
+- **New tests:** 8 new tests (unauthorized caller rejection for both functions, token pull + distribution for both, receive_repayment no-regression, receive_repayment single-distribution regression)
+- **Verification:** `cargo check`, `cargo test -p liquidity-pool-contract` (86 passed, 0 failed), `cargo clippy -p liquidity-pool-contract -- -D warnings` (0 warnings)
+
 ### Issue #7 — Follow-up: Missing `approve_vendor` in `RealIntegrationCtx::register_vendor`
 - Discovered second `register_vendor` helper in `RealIntegrationCtx` (integration test struct, ~line 2390) that only called `register_vendor` without `approve_vendor`
 - All integration tests using `RealIntegrationCtx` created loans with `Pending` vendors → `validate_vendor` → `is_active` returned `false` → `VendorNotActive` (#3)
