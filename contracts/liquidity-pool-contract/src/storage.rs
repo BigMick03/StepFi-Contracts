@@ -1,6 +1,7 @@
 use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
 use crate::errors::LiquidityPoolError;
+use crate::types::LedgerOutflowWindow;
 
 // Instance storage keys
 pub const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
@@ -12,9 +13,15 @@ pub const CREDITLINE_KEY: Symbol = symbol_short!("CRDTLIN");
 pub const TREASURY_KEY: Symbol = symbol_short!("TREASURY");
 pub const MERCHANT_FUND_KEY: Symbol = symbol_short!("MRCHFND");
 pub const REENTRANCY_LOCK_KEY: Symbol = symbol_short!("LOCKED");
+pub const VENDOR_REGISTRY_KEY: Symbol = symbol_short!("VNDRREG");
+pub const MAX_OUTFLOW_BPS_KEY: Symbol = symbol_short!("MAXOUT");
+pub const MAX_PER_MERCHANT_KEY: Symbol = symbol_short!("MAXMRCH");
+pub const OUTFLOW_WINDOW_KEY: Symbol = symbol_short!("OUTFLOW");
 
 // Persistent storage key prefix for LP shares
 pub const LP_SHARES_PREFIX: Symbol = symbol_short!("LPSHRS");
+// Persistent storage key prefix for per-merchant cumulative funding totals
+pub const MERCHANT_TOTAL_PREFIX: Symbol = symbol_short!("MRCHTOT");
 pub const PERSISTENT_TTL_THRESHOLD: u32 = 1_036_800;
 pub const PERSISTENT_TTL_EXTEND_TO: u32 = 2_073_600;
 // Version key (instance storage)
@@ -80,6 +87,86 @@ pub fn set_merchant_fund(env: &Env, merchant_fund: &Address) {
     env.storage()
         .instance()
         .set(&MERCHANT_FUND_KEY, merchant_fund);
+}
+
+// --- Vendor Registry (optional) ---
+
+/// Returns the optional registered vendor-registry contract address.
+/// When `None`, vendor cross-validation is disabled (backward compatible).
+pub fn get_vendor_registry(env: &Env) -> Result<Option<Address>, LiquidityPoolError> {
+    Ok(env.storage().instance().get(&VENDOR_REGISTRY_KEY))
+}
+
+/// Registers the vendor-registry contract used to validate merchants, or
+/// clears it (pass `None`) to disable vendor cross-validation.
+///
+/// `None` removes the key entirely (absence means disabled), matching how the
+/// other optional address references in this contract are read.
+pub fn set_vendor_registry(env: &Env, vendor_registry: &Option<Address>) {
+    match vendor_registry {
+        Some(address) => env.storage().instance().set(&VENDOR_REGISTRY_KEY, address),
+        None => env.storage().instance().remove(&VENDOR_REGISTRY_KEY),
+    }
+}
+
+// --- Per-ledger outflow cap ---
+
+/// Returns the maximum fraction of available liquidity that may be paid out
+/// through `fund_loan` within a single ledger, in basis points (0..=10000).
+pub fn get_max_outflow_bps(env: &Env) -> Result<u32, LiquidityPoolError> {
+    Ok(env
+        .storage()
+        .instance()
+        .get(&MAX_OUTFLOW_BPS_KEY)
+        .unwrap_or(crate::types::DEFAULT_MAX_OUTFLOW_BPS))
+}
+
+pub fn set_max_outflow_bps(env: &Env, bps: u32) {
+    env.storage().instance().set(&MAX_OUTFLOW_BPS_KEY, &bps);
+}
+
+/// Returns the rolling outflow window, or `None` before the first `fund_loan`.
+pub fn get_outflow_window(env: &Env) -> Result<Option<LedgerOutflowWindow>, LiquidityPoolError> {
+    Ok(env.storage().instance().get(&OUTFLOW_WINDOW_KEY))
+}
+
+pub fn set_outflow_window(env: &Env, window: &LedgerOutflowWindow) {
+    env.storage().instance().set(&OUTFLOW_WINDOW_KEY, window);
+}
+
+// --- Per-merchant concentration cap ---
+
+/// Returns the maximum cumulative amount fundable to a single merchant.
+/// `0` disables the concentration cap.
+pub fn get_max_per_merchant(env: &Env) -> Result<i128, LiquidityPoolError> {
+    Ok(env
+        .storage()
+        .instance()
+        .get(&MAX_PER_MERCHANT_KEY)
+        .unwrap_or(crate::types::DEFAULT_MAX_PER_MERCHANT))
+}
+
+pub fn set_max_per_merchant(env: &Env, max: i128) {
+    env.storage().instance().set(&MAX_PER_MERCHANT_KEY, &max);
+}
+
+/// Returns the cumulative amount funded to `merchant` so far.
+pub fn get_merchant_total(env: &Env, merchant: &Address) -> Result<i128, LiquidityPoolError> {
+    Ok(env
+        .storage()
+        .persistent()
+        .get(&(MERCHANT_TOTAL_PREFIX, merchant.clone()))
+        .unwrap_or(0))
+}
+
+/// Writes the cumulative amount funded to `merchant`. TTL is extended on every
+/// write so active merchants cannot be archived while they hold exposure.
+pub fn set_merchant_total(env: &Env, merchant: &Address, total: i128) {
+    let key = (MERCHANT_TOTAL_PREFIX, merchant.clone());
+    env.storage().persistent().set(&key, &total);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
 }
 
 // --- Total Shares ---

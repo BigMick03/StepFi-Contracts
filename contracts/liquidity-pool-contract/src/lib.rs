@@ -65,6 +65,49 @@ impl LiquidityPoolContract {
         storage::set_merchant_fund(&env, &merchant_fund);
     }
 
+    /// Set (or clear, with `None`) the vendor-registry contract used to
+    /// cross-check that a merchant is registered and active before funding.
+    /// When unset, `fund_loan` performs no vendor validation (legacy behavior).
+    pub fn set_vendor_registry(env: Env, admin: Address, vendor_registry: Option<Address>) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        storage::set_vendor_registry(&env, &vendor_registry);
+    }
+
+    /// Set the per-ledger outflow cap as a fraction of available liquidity,
+    /// in basis points (0..=10000). 10000 = entire available liquidity may be
+    /// paid out within a single ledger (cap effectively disabled).
+    pub fn set_max_outflow_bps(env: Env, admin: Address, bps: u32) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if bps > types::TOTAL_BPS as u32 {
+            panic_with_error!(&env, LiquidityPoolError::InvalidAmount);
+        }
+        storage::set_max_outflow_bps(&env, bps);
+    }
+
+    /// Set the maximum cumulative amount fundable to a single merchant.
+    /// `0` disables the concentration cap.
+    pub fn set_max_per_merchant(env: Env, admin: Address, max_per_merchant: i128) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if max_per_merchant < 0 {
+            panic_with_error!(&env, LiquidityPoolError::InvalidAmount);
+        }
+        storage::set_max_per_merchant(&env, max_per_merchant);
+    }
+
+    /// Current per-ledger outflow cap in basis points (0..=10000).
+    pub fn get_max_outflow_bps(env: Env) -> u32 {
+        storage::get_max_outflow_bps(&env).unwrap_or_else(|err| panic_with_error!(&env, err))
+    }
+
+    /// Current per-merchant cumulative funding cap (`0` = disabled).
+    pub fn get_max_per_merchant(env: Env) -> i128 {
+        storage::get_max_per_merchant(&env)
+            .unwrap_or_else(|err| panic_with_error!(&env, err))
+    }
+
     pub fn set_admin(env: Env, new_admin: Address) {
         let old_admin = storage::get_admin(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
         old_admin.require_auth();
@@ -242,6 +285,79 @@ impl LiquidityPoolContract {
             return Err(LiquidityPoolError::InsufficientLiquidity);
         }
 
+        // Optional vendor cross-check: when a vendor registry is registered,
+        // require the merchant to be an active (approved) vendor before any
+        // transfer. Skipped entirely when unset for backward compatibility.
+        if let Some(vendor_registry) = storage::get_vendor_registry(&env)
+            .unwrap_or_else(|err| panic_with_error!(&env, err))
+        {
+            Self::require_active_vendor(&env, &vendor_registry, &merchant)?;
+        }
+
+        // Per-ledger outflow cap (rolling window reset): cumulative fund_loan
+        // outflows within a single ledger may not exceed a configurable
+        // fraction of the available liquidity, enforced with a rolling window
+        // that resets whenever the ledger sequence moves. The budget is fixed
+        // from the available-liquidity snapshot taken when the window begins.
+        // `max_outflow_bps == 10000` disables the cap entirely so existing
+        // honest flows are unchanged.
+        let max_outflow_bps = storage::get_max_outflow_bps(&env)
+            .unwrap_or_else(|err| panic_with_error!(&env, err));
+        let mut remaining_ledger_cap = 0;
+        if max_outflow_bps < types::TOTAL_BPS as u32 {
+            let current_ledger = env.ledger().sequence();
+            let mut window = match storage::get_outflow_window(&env)
+                .unwrap_or_else(|err| panic_with_error!(&env, err))
+            {
+                Some(window) => window,
+                None => types::LedgerOutflowWindow {
+                    start_ledger: current_ledger,
+                    available,
+                    outflow: 0,
+                },
+            };
+            if window.start_ledger != current_ledger {
+                window = types::LedgerOutflowWindow {
+                    start_ledger: current_ledger,
+                    available,
+                    outflow: 0,
+                };
+            }
+            let ledger_cap = safe_math::div_i128(
+                safe_math::mul_i128(window.available, max_outflow_bps as i128)?,
+                types::TOTAL_BPS,
+            )?;
+            let window_after = safe_math::add_i128(window.outflow, amount)?;
+            if window_after > ledger_cap {
+                return Err(LiquidityPoolError::LedgerOutflowCapExceeded);
+            }
+            // Persist the rolling window *after* the checks pass, so failed
+            // attempts never consume cap headroom.
+            storage::set_outflow_window(
+                &env,
+                &types::LedgerOutflowWindow {
+                    start_ledger: window.start_ledger,
+                    available: window.available,
+                    outflow: window_after,
+                },
+            );
+            remaining_ledger_cap = safe_math::sub_i128(ledger_cap, window_after)?;
+        }
+
+        // Single-recipient concentration cap: cumulative funded-per-merchant may
+        // not exceed the configured ceiling (0 = disabled).
+        let max_per_merchant = storage::get_max_per_merchant(&env)
+            .unwrap_or_else(|err| panic_with_error!(&env, err));
+        let merchant_total = storage::get_merchant_total(&env, &merchant)
+            .unwrap_or_else(|err| panic_with_error!(&env, err));
+        let new_merchant_total = safe_math::add_i128(merchant_total, amount)?;
+        if max_per_merchant > 0 {
+            if new_merchant_total > max_per_merchant {
+                return Err(LiquidityPoolError::MerchantConcentrationCapExceeded);
+            }
+            storage::set_merchant_total(&env, &merchant, new_merchant_total);
+        }
+
         let new_locked = safe_math::add_i128(locked_liquidity, amount)?;
         storage::set_locked_liquidity(&env, new_locked);
 
@@ -250,8 +366,46 @@ impl LiquidityPoolContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &merchant, &amount);
 
-        events::emit_loan_funded(&env, &creditline, amount);
+        // Cap headroom after this funding, for indexer monitoring. 0 when the
+        // corresponding cap is disabled.
+        let remaining_merchant_cap = if max_per_merchant > 0 {
+            safe_math::sub_i128(max_per_merchant, new_merchant_total)?
+        } else {
+            0
+        };
+
+        events::emit_loan_funded(
+            &env,
+            &creditline,
+            &merchant,
+            amount,
+            remaining_ledger_cap,
+            remaining_merchant_cap,
+        );
         Self::exit_non_reentrant(&env);
+        Ok(())
+    }
+
+    /// Check `merchant` is an active vendor in `vendor_registry` via a
+    /// cross-contract `is_active` call. Uses `try_invoke_contract` so a broken
+    /// registry fails closed (rejects the funding) instead of panicking.
+    fn require_active_vendor(
+        env: &Env,
+        vendor_registry: &Address,
+        merchant: &Address,
+    ) -> Result<(), LiquidityPoolError> {
+        use soroban_sdk::IntoVal;
+        let is_active: bool = env
+            .try_invoke_contract::<bool, soroban_sdk::Error>(
+                vendor_registry,
+                &soroban_sdk::symbol_short!("is_active"),
+                (merchant.clone(),).into_val(env),
+            )
+            .map_err(|_| LiquidityPoolError::VendorNotRegistered)?
+            .map_err(|_| LiquidityPoolError::VendorNotRegistered)?;
+        if !is_active {
+            return Err(LiquidityPoolError::VendorNotActive);
+        }
         Ok(())
     }
 

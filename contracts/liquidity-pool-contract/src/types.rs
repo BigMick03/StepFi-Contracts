@@ -23,3 +23,37 @@ pub const SHARE_PRICE_PRECISION: i128 = 10_000;
 
 /// Minimum deposit / withdrawal to prevent rounding exploits
 pub const MIN_AMOUNT: i128 = 1;
+
+/// Default maximum fraction of *available* liquidity that may be paid out
+/// through `fund_loan` within a single ledger, in basis points.
+///
+/// Defaults to 10000 (= 100% of available liquidity, i.e. cap effectively
+/// disabled) so existing honest flows are unchanged until an admin configures
+/// a restrictive value via `set_max_outflow_bps`. A value such as 2500 (25%)
+/// bounds how fast a misbehaving creditline can drain the pool per ledger.
+pub const DEFAULT_MAX_OUTFLOW_BPS: u32 = 10000;
+
+/// Default maximum cumulative amount that may be funded to a single merchant
+/// before the pool rejects further `fund_loan` calls for that address.
+///
+/// `0` means the concentration cap is disabled (fully open, matching legacy
+/// behavior) so existing honest flows are unchanged until an admin configures
+/// a ceiling via `set_max_per_merchant`.
+pub const DEFAULT_MAX_PER_MERCHANT: i128 = 0;
+
+/// Rolling window used by the per-ledger outflow cap. When the current ledger
+/// sequence exceeds `start_ledger`, the window is treated as expired and the
+/// accumulated outflow resets.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerOutflowWindow {
+    /// Ledger sequence in which this window began.
+    pub start_ledger: u32,
+    /// Available liquidity snapshot when the window began. The per-ledger
+    /// budget is `available × max_outflow_bps / 10000`, fixed for the window.
+    pub available: i128,
+    /// Cumulative `fund_loan` outflows within the current window.
+    pub outflow: i128,
+}
+
+

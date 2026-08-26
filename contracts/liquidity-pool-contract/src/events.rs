@@ -25,9 +25,24 @@ pub fn emit_liquidity_withdrawn(
         .publish((WITHDRAWN, provider), (shares_burned, amount_returned));
 }
 
-/// Emitted when the pool funds a loan (CreditLine → merchant)
-pub fn emit_loan_funded(env: &Env, creditline: &Address, amount: i128) {
-    env.events().publish((LOAN_FUNDED, creditline), amount);
+/// Emitted when the pool funds a loan (CreditLine → merchant).
+///
+/// Topics: (LQFUND, creditline, merchant)
+/// Data: (amount, remaining_ledger_cap, remaining_merchant_cap) where each
+/// `remaining_*` is the headroom left after this funding (0 when the
+/// corresponding cap is disabled), for indexer monitoring of cap headroom.
+pub fn emit_loan_funded(
+    env: &Env,
+    creditline: &Address,
+    merchant: &Address,
+    amount: i128,
+    remaining_ledger_cap: i128,
+    remaining_merchant_cap: i128,
+) {
+    env.events().publish(
+        (LOAN_FUNDED, creditline, merchant),
+        (amount, remaining_ledger_cap, remaining_merchant_cap),
+    );
 }
 
 /// Emitted when principal + interest repayment is received from CreditLine

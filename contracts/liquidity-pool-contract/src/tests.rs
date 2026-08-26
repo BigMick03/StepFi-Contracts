@@ -1,9 +1,10 @@
 use crate::{LiquidityPoolContract, LiquidityPoolContractClient, LiquidityPoolError};
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, IntoVal,
+    Address, Env, IntoVal, TryIntoVal,
 };
+use vendor_registry_contract::VendorRegistryContract;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,47 @@ impl TestEnv {
         let token_address = self.token.address.clone();
         let token_sac = StellarAssetClient::new(&self.env, &token_address);
         token_sac.mint(recipient, &amount);
+    }
+
+    /// Advance to the next ledger sequence (used to test the rolling
+    /// per-ledger outflow window reset).
+    fn advance_ledger(&self) {
+        let current = self.env.ledger().sequence();
+        self.env.ledger().set_sequence_number(current + 1);
+    }
+
+    /// Register + initialize a real vendor-registry contract and return its
+    /// address.
+    fn register_vendor_registry(&self) -> Address {
+        let registry_id = self.env.register(VendorRegistryContract, ());
+        let _: Result<(), vendor_registry_contract::VendorRegistryError> = self
+            .env
+            .invoke_contract(
+                &registry_id,
+                &soroban_sdk::Symbol::new(&self.env, "initialize"),
+                (&self.admin,).into_val(&self.env),
+            );
+        registry_id
+    }
+
+    /// Register + approve `vendor` in the given vendor registry so it is
+    /// considered an active vendor.
+    fn register_and_approve_vendor(&self, registry: &Address, vendor: &Address) {
+        let name = soroban_sdk::String::from_str(&self.env, "Test Vendor");
+        let _: Result<(), vendor_registry_contract::VendorRegistryError> = self
+            .env
+            .invoke_contract(
+                registry,
+                &soroban_sdk::Symbol::new(&self.env, "register_vendor"),
+                (&self.admin, vendor, name).into_val(&self.env),
+            );
+        let _: Result<(), vendor_registry_contract::VendorRegistryError> = self
+            .env
+            .invoke_contract(
+                registry,
+                &soroban_sdk::Symbol::new(&self.env, "approve_vendor"),
+                (&self.admin, vendor).into_val(&self.env),
+            );
     }
 }
 
@@ -2724,4 +2766,343 @@ fn test_absorb_loss_emits_event() {
 
     let events = t.env.events().all();
     assert!(!events.is_empty(), "Expected LQLOSS event to be emitted");
+}
+
+// ─── defense-in-depth: per-ledger outflow cap ────────────────────────────────
+
+#[test]
+fn test_ledger_outflow_cap_bounds_repeated_funding() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    // 25% of 10,000 available = 2,500 per ledger
+    t.client.set_max_outflow_bps(&t.admin, &2500);
+
+    t.client.fund_loan(&t.creditline, &merchant, &2_000);
+    t.client.fund_loan(&t.creditline, &merchant, &500);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 2_500);
+    assert_eq!(stats.available_liquidity, 7_500);
+
+    // Any further funding within the same ledger exceeds the cap
+    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
+    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
+
+    // Rejected attempts must not consume cap headroom or lock liquidity
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 2_500);
+    assert_eq!(stats.available_liquidity, 7_500);
+}
+
+#[test]
+fn test_ledger_outflow_cap_resets_on_new_ledger() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    t.client.set_max_outflow_bps(&t.admin, &2500);
+
+    // First ledger: use the full 2,500 cap, then hit the ceiling
+    t.client.fund_loan(&t.creditline, &merchant, &2_000);
+    t.client.fund_loan(&t.creditline, &merchant, &500);
+    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
+    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
+
+    // New ledger: rolling window resets, full budget available again.
+    // New window snapshots available = 7,500 → budget = 25% = 1,875.
+    t.advance_ledger();
+    t.client.fund_loan(&t.creditline, &merchant, &1_875);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 4_375);
+    assert_eq!(stats.available_liquidity, 5_625);
+
+    // Still capped within the new ledger
+    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
+    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
+}
+
+#[test]
+fn test_ledger_outflow_cap_defaults_to_disabled() {
+    // Backward compatibility: without explicit configuration the whole
+    // available liquidity can be funded in a single ledger.
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    t.client.fund_loan(&t.creditline, &merchant, &1_000);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 1_000);
+    assert_eq!(stats.available_liquidity, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_set_max_outflow_bps_above_10000_fails() {
+    let t = TestEnv::setup();
+    t.client.set_max_outflow_bps(&t.admin, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_set_max_outflow_bps_by_non_admin_fails() {
+    let t = TestEnv::setup();
+    let intruder = Address::generate(&t.env);
+    t.client.set_max_outflow_bps(&intruder, &2500);
+}
+
+// ─── defense-in-depth: per-merchant concentration cap ────────────────────────
+
+#[test]
+fn test_merchant_concentration_cap_rejects_excess_funding() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    // Cap cumulative funding per merchant at 3,000
+    t.client.set_max_per_merchant(&t.admin, &3_000);
+
+    t.client.fund_loan(&t.creditline, &merchant, &2_000);
+    t.client.fund_loan(&t.creditline, &merchant, &1_000);
+
+    // Exceeds the 3,000 ceiling
+    let res = t.client.try_fund_loan(&t.creditline, &merchant, &500);
+    assert_eq!(
+        res,
+        Err(Ok(LiquidityPoolError::MerchantConcentrationCapExceeded))
+    );
+
+    // Rejected funding does not lock liquidity
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 3_000);
+}
+
+#[test]
+fn test_merchant_concentration_cap_is_per_merchant() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    t.client.set_max_per_merchant(&t.admin, &3_000);
+
+    let merchant1 = Address::generate(&t.env);
+    let merchant2 = Address::generate(&t.env);
+
+    t.client.fund_loan(&t.creditline, &merchant1, &2_000);
+    t.client.fund_loan(&t.creditline, &merchant2, &3_000);
+
+    // merchant1 still has 1,000 headroom (separate bucket per merchant)
+    t.client.fund_loan(&t.creditline, &merchant1, &1_000);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 6_000);
+}
+
+#[test]
+fn test_merchant_concentration_cap_disabled_by_default() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    // No ceiling configured → concentration is unbounded
+    t.client.fund_loan(&t.creditline, &merchant, &9_000);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 9_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_set_max_per_merchant_negative_fails() {
+    let t = TestEnv::setup();
+    t.client.set_max_per_merchant(&t.admin, &-1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_set_max_per_merchant_by_non_admin_fails() {
+    let t = TestEnv::setup();
+    let intruder = Address::generate(&t.env);
+    t.client.set_max_per_merchant(&intruder, &1_000);
+}
+
+// ─── defense-in-depth: optional vendor cross-check ───────────────────────────
+
+#[test]
+fn test_fund_loan_vendor_cross_check_approves_active_merchant() {
+    let t = TestEnv::setup();
+    let registry = t.register_vendor_registry();
+    t.client.set_vendor_registry(&t.admin, &Some(registry.clone()));
+
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    t.register_and_approve_vendor(&registry, &merchant);
+
+    // Honest flow: approved merchant receives funding
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_fund_loan_vendor_cross_check_rejects_unregistered_merchant() {
+    let t = TestEnv::setup();
+    let registry = t.register_vendor_registry();
+    t.client.set_vendor_registry(&t.admin, &Some(registry));
+
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    // merchant was never registered → is_active returns false
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_fund_loan_vendor_cross_check_rejects_suspended_merchant() {
+    let t = TestEnv::setup();
+    let registry = t.register_vendor_registry();
+    t.client.set_vendor_registry(&t.admin, &Some(registry.clone()));
+
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    t.register_and_approve_vendor(&registry, &merchant);
+
+    // Suspend the merchant → is_active now returns false
+    let _: Result<(), vendor_registry_contract::VendorRegistryError> = t
+        .env
+        .invoke_contract(
+            &registry,
+            &soroban_sdk::Symbol::new(&t.env, "suspend_vendor"),
+            (&t.admin, &merchant).into_val(&t.env),
+        );
+
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+}
+
+#[test]
+fn test_fund_loan_vendor_cross_check_skipped_when_unset() {
+    // Backward compatibility: no registry configured → no validation.
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 400);
+}
+
+#[test]
+fn test_set_vendor_registry_clear_disables_cross_check() {
+    let t = TestEnv::setup();
+    let registry = t.register_vendor_registry();
+    t.client.set_vendor_registry(&t.admin, &Some(registry));
+
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    // Clear the registry → validation off → unregistered merchant accepted
+    t.client.set_vendor_registry(&t.admin, &None);
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_set_vendor_registry_by_non_admin_fails() {
+    let t = TestEnv::setup();
+    let intruder = Address::generate(&t.env);
+    let registry = t.register_vendor_registry();
+    t.client.set_vendor_registry(&intruder, &Some(registry));
+}
+
+#[test]
+fn test_set_vendor_registry_roundtrip_affects_funding() {
+    // Admin can set and clear the registry; behavior follows each state.
+    let t = TestEnv::setup();
+    let registry = t.register_vendor_registry();
+
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 1_000);
+    t.client.deposit(&provider, &1_000);
+
+    // With the registry set, an unregistered merchant is rejected
+    t.client.set_vendor_registry(&t.admin, &Some(registry));
+    let res = t.client.try_fund_loan(&t.creditline, &merchant, &400);
+    assert_eq!(res, Err(Ok(LiquidityPoolError::VendorNotActive)));
+
+    // Clearing the registry restores the unvalidated (legacy) behavior
+    t.client.set_vendor_registry(&t.admin, &None);
+    t.client.fund_loan(&t.creditline, &merchant, &400);
+
+    let stats = t.client.get_pool_stats();
+    assert_eq!(stats.locked_liquidity, 400);
+}
+
+// ─── defense-in-depth: granular LQFUND event payload ─────────────────────────
+
+#[test]
+fn test_fund_loan_event_includes_merchant_and_remaining_caps() {
+    let t = TestEnv::setup();
+    let provider = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    t.mint(&provider, 10_000);
+    t.client.deposit(&provider, &10_000);
+
+    t.client.set_max_outflow_bps(&t.admin, &2500);
+    t.client.set_max_per_merchant(&t.admin, &5_000);
+
+    t.client.fund_loan(&t.creditline, &merchant, &1_000);
+
+    let events = t.env.events().all();
+    let mut found = false;
+    for e in events.iter() {
+        let topic: soroban_sdk::Symbol = e.1.get_unchecked(0).into_val(&t.env);
+        if topic == soroban_sdk::Symbol::new(&t.env, "LQFUND") {
+            // topics = (LQFUND, creditline, merchant)
+            let topic_creditline: Address = e.1.get_unchecked(1).into_val(&t.env);
+            let topic_merchant: Address = e.1.get_unchecked(2).into_val(&t.env);
+            assert_eq!(topic_creditline, t.creditline);
+            assert_eq!(topic_merchant, merchant);
+
+            // data = (amount, remaining_ledger_cap, remaining_merchant_cap)
+            let (amount, remaining_ledger_cap, remaining_merchant_cap): (i128, i128, i128) =
+                e.2.clone().try_into_val(&t.env).unwrap();
+            assert_eq!(amount, 1_000);
+            assert_eq!(remaining_ledger_cap, 1_500); // 2,500 cap − 1,000 funded
+            assert_eq!(remaining_merchant_cap, 4_000); // 5,000 cap − 1,000 funded
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "LQFUND event not found");
 }
