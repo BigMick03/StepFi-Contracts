@@ -1,13 +1,15 @@
 use soroban_sdk::{symbol_short, Address, Env, Symbol};
 
-use crate::types::ProtocolParameters;
+use crate::types::{MultisigConfig, ProtocolParameters};
 
 const PARAMS_UPDATED: Symbol = symbol_short!("PARMUPDT");
 const ADMIN_UPDATED: Symbol = symbol_short!("PARMADMN");
 const MS_CONFIGURED: Symbol = symbol_short!("MSCONFIG");
+const MSIG_PENDING: Symbol = symbol_short!("MSIGPEND");
 const PROP_CREATED: Symbol = symbol_short!("PROPNEW");
 const PROP_APPROVED: Symbol = symbol_short!("PROPAPPR");
 const PROP_EXECUTED: Symbol = symbol_short!("PROPEXEC");
+const PROP_INVALIDATED: Symbol = symbol_short!("PROPINVL");
 
 pub fn emit_parameters_updated(env: &Env, admin: &Address, params: &ProtocolParameters) {
     env.events().publish(
@@ -39,6 +41,22 @@ pub fn emit_contract_upgraded(env: &Env, old_version: u32, new_version: u32) {
 pub fn emit_multisig_configured(env: &Env, threshold: u32, num_signers: u32) {
     env.events()
         .publish((MS_CONFIGURED,), (threshold, num_signers));
+}
+
+/// Prominent event emitted when the admin *requests* a multisig configuration
+/// (two-step: request → confirm). Carries the full signer list so the pending
+/// change is observable on-chain before it becomes active.
+pub fn emit_multisig_pending(env: &Env, admin: &Address, config: &MultisigConfig) {
+    env.events().publish(
+        (MSIG_PENDING, admin),
+        (config.threshold, config.signers.clone()),
+    );
+}
+
+/// Emitted when an in-flight proposal that targets the signer set is
+/// invalidated because the signer set changed.
+pub fn emit_proposal_invalidated(env: &Env, id: u64) {
+    env.events().publish((PROP_INVALIDATED,), id);
 }
 
 pub fn emit_proposal_created(env: &Env, id: u64, proposer: &Address) {

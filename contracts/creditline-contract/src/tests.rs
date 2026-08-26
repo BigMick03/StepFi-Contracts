@@ -2671,10 +2671,13 @@ fn test_parameters_contract_controls_guarantee_thresholds() {
     // and push the update through the propose/approve/execute flow.
     let signer_a = Address::generate(&t.env);
     let signer_b = Address::generate(&t.env);
+    // Two-step multisig setup: request then confirm (admin signs twice).
     t.parameters.configure_multisig(
+        &t.admin,
         &soroban_sdk::vec![&t.env, signer_a.clone(), signer_b.clone()],
         &2u32,
     );
+    t.parameters.confirm_multisig(&t.admin);
     let proposal_id = t
         .parameters
         .propose(&signer_a, &ProposalAction::UpdateParameters(params));

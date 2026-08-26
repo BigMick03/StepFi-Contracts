@@ -38,20 +38,48 @@ impl ParametersContract {
         Self::initialize(env, admin, default_parameters());
     }
 
-    pub fn configure_multisig(env: Env, signers: Vec<Address>, threshold: u32) {
-        let admin = storage::get_admin(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
+    /// Step 1 of 2 for configuring the multisig (admin only). Stages a pending
+    /// configuration and emits a prominent event; the config only becomes
+    /// active after the admin confirms with a second, separate signature via
+    /// `confirm_multisig`. This prevents a single admin key from silently
+    /// swapping the signer set in one transaction.
+    pub fn configure_multisig(env: Env, admin: Address, signers: Vec<Address>, threshold: u32) {
         admin.require_auth();
         access::require_admin(&env, &admin);
 
         if storage::has_multisig(&env) {
             panic_with_error!(&env, ParametersError::MultisigAlreadyConfigured);
         }
+        if storage::has_pending_multisig(&env) {
+            panic_with_error!(&env, ParametersError::MultisigPendingExists);
+        }
 
         let config = MultisigConfig { signers, threshold };
         Self::validate_multisig_config(&env, &config);
 
         Self::enter_non_reentrant(&env);
+        storage::set_pending_multisig(&env, &config);
+        events::emit_multisig_pending(&env, &admin, &config);
+        Self::exit_non_reentrant(&env);
+    }
+
+    /// Step 2 of 2 for configuring the multisig (admin only). Requires a fresh
+    /// admin signature (separate transaction from `configure_multisig`) and
+    /// activates the pending configuration.
+    pub fn confirm_multisig(env: Env, admin: Address) {
+        admin.require_auth();
+        access::require_admin(&env, &admin);
+
+        if storage::has_multisig(&env) {
+            panic_with_error!(&env, ParametersError::MultisigAlreadyConfigured);
+        }
+        let config = storage::get_pending_multisig(&env)
+            .unwrap_or_else(|err| panic_with_error!(&env, err));
+        Self::validate_multisig_config(&env, &config);
+
+        Self::enter_non_reentrant(&env);
         storage::set_multisig(&env, &config);
+        storage::clear_pending_multisig(&env);
         events::emit_multisig_configured(&env, config.threshold, config.signers.len());
         Self::exit_non_reentrant(&env);
     }
@@ -75,6 +103,13 @@ impl ParametersContract {
             .checked_add(PROPOSAL_TTL_SECONDS)
             .unwrap_or_else(|| panic_with_error!(&env, ParametersError::Overflow));
 
+        // Snapshot the current eligible signer set at proposal time. Every
+        // approver must later be validated against this snapshot AND the
+        // current membership, so signers removed (or added) afterwards can
+        // neither approve nor have their approval counted.
+        let config = storage::get_multisig(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
+        let eligible_signers = config.signers;
+
         let id = storage::next_proposal_id(&env);
         let mut approvals = Vec::new(&env);
         approvals.push_back(proposer.clone());
@@ -84,9 +119,11 @@ impl ParametersContract {
             action,
             proposer: proposer.clone(),
             approvals,
+            eligible_signers,
             created_at: now,
             expires_at,
             executed: false,
+            invalidated: false,
         };
         storage::set_proposal(&env, &proposal);
         events::emit_proposal_created(&env, id, &proposer);
@@ -100,6 +137,9 @@ impl ParametersContract {
         let mut proposal =
             storage::get_proposal(&env, proposal_id).unwrap_or_else(|err| panic_with_error!(&env, err));
 
+        if proposal.invalidated {
+            panic_with_error!(&env, ParametersError::ProposalInvalidated);
+        }
         if proposal.executed {
             panic_with_error!(&env, ParametersError::ProposalAlreadyExecuted);
         }
@@ -108,6 +148,12 @@ impl ParametersContract {
         }
         if proposal.approvals.contains(&signer) {
             panic_with_error!(&env, ParametersError::DuplicateSignature);
+        }
+        // The signer is a current member (checked above via require_signer);
+        // they must ALSO have been eligible when the proposal was created.
+        // This rejects signers added to the committee after the proposal.
+        if !proposal.eligible_signers.contains(&signer) {
+            panic_with_error!(&env, ParametersError::NotEligibleSigner);
         }
 
         proposal.approvals.push_back(signer.clone());
@@ -121,6 +167,9 @@ impl ParametersContract {
         let mut proposal =
             storage::get_proposal(&env, proposal_id).unwrap_or_else(|err| panic_with_error!(&env, err));
 
+        if proposal.invalidated {
+            panic_with_error!(&env, ParametersError::ProposalInvalidated);
+        }
         if proposal.executed {
             panic_with_error!(&env, ParametersError::ProposalAlreadyExecuted);
         }
@@ -129,8 +178,32 @@ impl ParametersContract {
         }
 
         let config = storage::get_multisig(&env).unwrap_or_else(|err| panic_with_error!(&env, err));
-        if proposal.approvals.len() < config.threshold {
-            panic_with_error!(&env, ParametersError::ThresholdNotMet);
+
+        // Every approver must have been eligible at proposal time AND still be
+        // a current member. A single stale approver invalidates the proposal,
+        // so a signer removed after approving can never have their approval
+        // counted toward execution.
+        for i in 0..proposal.approvals.len() {
+            let approver = proposal.approvals.get_unchecked(i);
+            if !proposal.eligible_signers.contains(&approver) || !config.signers.contains(&approver) {
+                panic_with_error!(&env, ParametersError::StaleApproval);
+            }
+        }
+
+        // Signer-set changes require a strictly higher quorum (threshold + 1,
+        // capped at unanimity) so signers cannot cheapen their own gate or
+        // admit colluders with the old threshold.
+        let required_quorum = match &proposal.action {
+            ProposalAction::UpdateSigners(_) => Self::elevated_quorum(&config),
+            _ => config.threshold,
+        };
+        if proposal.approvals.len() < required_quorum {
+            match &proposal.action {
+                ProposalAction::UpdateSigners(_) => {
+                    panic_with_error!(&env, ParametersError::ElevatedQuorumNotMet);
+                }
+                _ => panic_with_error!(&env, ParametersError::ThresholdNotMet),
+            }
         }
 
         Self::enter_non_reentrant(&env);
@@ -190,6 +263,40 @@ impl ParametersContract {
         Self::validate_multisig_config(env, config);
         storage::set_multisig(env, config);
         events::emit_multisig_configured(env, config.threshold, config.signers.len());
+        // The signer set changed: clear/re-validate in-flight proposals that
+        // target the signer set, so a stale proposal cannot install a further
+        // signer-set change under the old membership.
+        Self::invalidate_signer_proposals(env);
+    }
+
+    /// Mark every in-flight proposal whose action targets the signer set as
+    /// invalidated. Called whenever the signer set changes. Non-signer-targeting
+    /// proposals are left alone — they re-validate themselves at execute time
+    /// via the eligible-signers snapshot.
+    fn invalidate_signer_proposals(env: &Env) {
+        let count = storage::get_proposal_count(env);
+        for id in 0..count {
+            let Ok(mut proposal) = storage::get_proposal(env, id) else {
+                continue;
+            };
+            if proposal.executed || proposal.invalidated {
+                continue;
+            }
+            if matches!(&proposal.action, ProposalAction::UpdateSigners(_)) {
+                proposal.invalidated = true;
+                storage::set_proposal(env, &proposal);
+                events::emit_proposal_invalidated(env, id);
+            }
+        }
+    }
+
+    /// Quorum required to change the signer set: the current threshold + 1,
+    /// capped at full unanimity of the current signer set so it is always
+    /// achievable (e.g. 2-of-3 → 3, 3-of-3 → 3, 4-of-7 → 5).
+    fn elevated_quorum(config: &MultisigConfig) -> u32 {
+        let n = config.signers.len();
+        let threshold_plus_one = config.threshold.checked_add(1).unwrap_or(n);
+        threshold_plus_one.min(n)
     }
 
     fn validate_parameters(env: &Env, params: &ProtocolParameters) {

@@ -8,6 +8,7 @@ pub const PARAMS_KEY: Symbol = symbol_short!("PARAMS");
 pub const REENTRANCY_LOCK: Symbol = symbol_short!("LOCKED");
 pub const VERSION_KEY: Symbol = symbol_short!("VERSION");
 pub const MULTISIG_KEY: Symbol = symbol_short!("MSIG");
+pub const PENDING_MULTISIG_KEY: Symbol = symbol_short!("MSIGPND");
 pub const PROP_CNT_KEY: Symbol = symbol_short!("PROPCNT");
 
 // TTL constants (in ledgers — 1 ledger ≈ 5 seconds on mainnet)
@@ -75,6 +76,27 @@ pub fn set_multisig(env: &Env, config: &MultisigConfig) {
     env.storage().instance().set(&MULTISIG_KEY, config);
 }
 
+pub fn has_pending_multisig(env: &Env) -> bool {
+    env.storage().instance().has(&PENDING_MULTISIG_KEY)
+}
+
+/// Returns the staged (not yet confirmed) multisig configuration requested by
+/// the admin. Errors with `MultisigNotPending` when no request is staged.
+pub fn get_pending_multisig(env: &Env) -> Result<MultisigConfig, ParametersError> {
+    env.storage()
+        .instance()
+        .get(&PENDING_MULTISIG_KEY)
+        .ok_or(ParametersError::MultisigNotPending)
+}
+
+pub fn set_pending_multisig(env: &Env, config: &MultisigConfig) {
+    env.storage().instance().set(&PENDING_MULTISIG_KEY, config);
+}
+
+pub fn clear_pending_multisig(env: &Env) {
+    env.storage().instance().remove(&PENDING_MULTISIG_KEY);
+}
+
 pub fn next_proposal_id(env: &Env) -> u64 {
     let id: u64 = env.storage().instance().get(&PROP_CNT_KEY).unwrap_or(0u64);
     let next = id
@@ -82,6 +104,12 @@ pub fn next_proposal_id(env: &Env) -> u64 {
         .unwrap_or_else(|| panic_with_error!(env, ParametersError::Overflow));
     env.storage().instance().set(&PROP_CNT_KEY, &next);
     id
+}
+
+/// Total number of proposals created so far (ids are contiguous from 0).
+/// Used to scan in-flight proposals when the signer set changes.
+pub fn get_proposal_count(env: &Env) -> u64 {
+    env.storage().instance().get(&PROP_CNT_KEY).unwrap_or(0u64)
 }
 
 pub fn get_proposal(env: &Env, id: u64) -> Result<Proposal, ParametersError> {

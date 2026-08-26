@@ -16,6 +16,17 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Completed
 
+### Parameters-Contract Multisig Hardening (stale approvals, threshold reduction, admin bypass)
+- **Problem:** three flaws made the governance multisig "theater": (1) `configure_multisig()` required only the single admin key's auth, so one compromised key could silently install any signer set; (2) proposals stored only `approvals: Vec<Address>`, so a signer removed by an executed `UpdateSigners` kept their approval counted by `execute()` (len >= threshold only); (3) `execute()` validated against the current config with no escalation guard, so a 2-of-3 set could propose `UpdateSigners` to 2-of-2 (or admit a colluder) with only old-threshold approvals.
+- **Eligible-signer snapshot:** `Proposal` now records `eligible_signers: Vec<Address>` (snapshot of the current signer set at propose time). `approve()` requires the signer to be a current member AND in the snapshot (rejects signers added after the proposal — `NotEligibleSigner = 23`); `execute()` validates every approver against the snapshot AND current membership and panics `StaleApproval = 21` if any approver was removed since — so removed signers' approvals are never counted (acceptance criterion 1).
+- **Elevated quorum for signer-set changes:** `UpdateSigners` requires `threshold + 1` approvals, capped at full unanimity of the current signer set (2-of-3 → 3, 3-of-3 → 3, 4-of-7 → 5), so the quorum is always achievable. Cheapening to a weaker threshold or admitting a colluder now needs more than the old threshold (`ElevatedQuorumNotMet = 22`). Chosen over bare `threshold + 1` because that would brick 3-of-3 and up.
+- **Two-step `configure_multisig`:** `configure_multisig(admin, signers, threshold)` now only *stages* a pending config and emits a prominent `MSIGPEND` event carrying the full signer list; `confirm_multisig(admin)` activates it with a second, separate admin signature and emits the existing `MSCONFIG` event. A single admin key can no longer atomically swap the signer set; the pending change is observable on-chain before activation. New errors `MultisigPendingExists = 18`, `MultisigNotPending = 19`.
+- **In-flight invalidation:** when `do_update_signers` executes, every in-flight (not executed/invalidated) proposal whose action is `UpdateSigners` is marked `invalidated` and emits `PROPINVL`; invalidated proposals cannot be approved or executed (`ProposalInvalidated = 20`). Non-signer-targeting proposals are left alone — they re-validate at execute time via the snapshot, so e.g. a parameters proposal whose approvers are all still members still executes (only stale approvals die).
+- **Tests (17 new, 37 total in parameters-contract, all green):** stale-approval exploit reproduced end-to-end (approve params proposal, remove the approver via `UpdateSigners`, then `execute` fails `StaleApproval` and params stay unchanged — pre-fix this executed), self-serving threshold reduction rejected (`ElevatedQuorumNotMet`), colluder admission rejected, unanimity path succeeds, two-step configure (pending not active, second request rejected, confirm without pending rejected, non-admin guards on both steps), in-flight signer proposal invalidation (approve+execute both blocked), unrelated signer change leaves valid proposals executable, full rotation kills old proposals, added-signer approval rejected (`NotEligibleSigner`), removed-signer approval rejected, and `MSIGPEND`/`MSCONFIG`/`PROPINVL` event assertions. Creditline integration test updated for the new `configure_multisig(admin, …)` + `confirm_multisig` flow.
+- **Storage note:** `Proposal` gained two fields (`eligible_signers`, `invalidated`), which changes its persistent XDR layout. parameters-contract is deployed on testnet; old in-flight proposals (if any) would fail to decode, so deployment of this change requires an upgrade and re-proposal of any in-flight items (see Open Questions).
+- **Verification:** `cargo test --workspace` → all 6 crates green (373 tests, 0 failed; parameters-contract 37); `cargo clippy -p parameters-contract -- -D warnings` clean for all changed code (only pre-existing dead-code lints in the untouched `safe_math.rs` remain, same as other contracts); `wasm32-unknown-unknown --release` build succeeds.
+- **Files:** `contracts/parameters-contract/src/lib.rs`, `storage.rs`, `types.rs`, `errors.rs`, `events.rs`, `tests.rs`, plus `contracts/creditline-contract/src/tests.rs` (call-site update)
+
 ### Issue #58 — Principal-Interest-Fee Repayment Waterfall
 - Added `RepaymentAllocation` struct and `apply_waterfall()` helper in `lib.rs` with correct priority: late fees → interest → service fee → principal
 - Fixed `repay_loan()` to use the corrected waterfall order (was principal-first, now late-fees-first)
@@ -167,6 +178,7 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Open Questions
 
+- **Proposal layout change on deployed testnet** — the hardened `Proposal` struct added `eligible_signers`/`invalidated` fields, changing its persistent XDR layout. The deployed parameters-contract must be upgraded, and any in-flight proposals from before the upgrade would fail to decode (re-propose them). Is that acceptable, or should the upgrade path clear old proposals first?
 - What token is used for loans — native XLM or a USDC anchor? (Affects token contract address in `initialize()`)
 - What is the correct `grace_period_seconds` for learner installment loans? (Longer than standard BNPL — possibly 7-14 days per installment)
 - Should sponsor pool deposits go through `liquidity-pool-contract` or a new `sponsor-pool-contract`?
@@ -175,6 +187,7 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Architecture Decisions
 
+- **Elevated quorum for signer-set changes** — `threshold + 1` capped at unanimity of the *current* signer set, chosen over bare `threshold + 1` (which is unachievable for 3-of-3) and over flat unanimity (which is heavy for large committees). Documented in the multisig hardening entry above.
 - **6 contracts, not 5** — `vouching-contract` added for mentor-based reputation boosting. `lp-contract` was dead code, removed. `liquidity-pool-contract` is the canonical LP implementation.
 - **Vendor over Merchant** — Renamed to reflect StepFi's learning-focused domain.
 - **TTL approach** — Using 60-day threshold / 120-day extension constants. Off-chain indexer is responsible for bumping TTL on active loan entries.

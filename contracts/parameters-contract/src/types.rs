@@ -63,9 +63,18 @@ pub struct Proposal {
     pub action: ProposalAction,
     pub proposer: Address,
     pub approvals: Vec<Address>,
+    /// Snapshot of the eligible signer set taken when the proposal was created.
+    /// `approve()` and `execute()` validate every approver against this snapshot
+    /// AND the current signer set, so a signer removed (or added) after the
+    /// proposal was created can neither approve nor have their approval counted.
+    pub eligible_signers: Vec<Address>,
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    /// Set when the signer set changed and this proposal targets the signer set
+    /// (action == UpdateSigners). Invalidated proposals cannot be approved or
+    /// executed.
+    pub invalidated: bool,
 }
 
 #[contracttype]
