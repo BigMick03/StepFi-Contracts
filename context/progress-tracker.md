@@ -103,6 +103,27 @@ Update this file after every completed contract change, fix, or architectural de
 - Added version and upgrade unit tests
 - Removed unused `safe_math` functions (replaced with comment placeholder for future use)
 
+### Issue #87 — Vouch expiry & boost-accounting clamp
+- **Problem:** Vouches never expired on-chain (no `expire_vouch`, no enforcement), so a mentor's boost inflated a learner's reputation permanently. Secondary: `revoke_vouch()` subtracted the historical `boost_amount` while `vouch()` re-minted with the *current* config boost, and `remove_boost` could push a learner's score below their pre-vouch baseline when combined with penalties or a mid-life boost-config change.
+- **Fix (vouching-contract, not yet deployed — `PENDING_DEPLOYMENT`, so the `VouchRecord` layout change is safe):**
+  - Added `VOUCH_DURATION: u64 = 2_592_000` (30 days) in `types.rs`.
+  - Added permissionless `expire_vouch(mentor, learner)` (no `require_auth`, mirrors creditline's `apply_late_fees`): validates `record.ts + VOUCH_DURATION < now` (else `VouchNotExpired = 13`), deactivates the record, and removes the boost (clamped). Idempotent — re-expiring an already-inactive record is a no-op.
+  - `get_vouches()` now returns expired records with `active = false` regardless of stored state, so readers never see a stale active boost.
+  - Added `baseline: u32` to `VouchRecord` (learner score before this vouch's boost) and a `get_reputation_score()` cross-contract read. New `remove_reputation_boost_clamped()` removes only `min(boost_amount, current_score - baseline)`, so removal can never drop the learner below their pre-vouch baseline even after penalties/config changes.
+  - `revoke_vouch()` now uses the clamped removal instead of subtracting the raw `boost_amount`.
+  - New event `VOUCHEXPIRED`; new error `VouchNotExpired = 13`.
+- **Tests (`tests.rs`):** added `decrease_score` to the mock reputation contract and 6 new tests — permissionless expiry removes boost, expiry-before-TTL rejected (`VouchNotExpired`), idempotent expiry, revoke-after-expiry fails cleanly (`VouchNotActive`), `get_vouches` marks expired inactive without an explicit expire, and boost removal clamped to baseline (pre-existing reputation + penalty scenario).
+- **Verification (initial):** `cargo test -p vouching-contract` → 24 passed, 0 failed.
+
+### Issue #87 — Revision (automated audit follow-up)
+- **Audit findings addressed:**
+  - **Order-dependent drift on multiple overlapping vouches.** The initial per-record `baseline` (captured at each vouch's own time) made `remove_reputation_boost_clamped` non-additive: with two concurrent vouches across a boost-config change (boost 10 then 5), expiring the older/larger vouch first clamped the successor's removal to zero, permanently leaving a residual boost. Replaced per-record baseline with a **shared learner baseline** (score before ANY active vouch, captured on the first vouch and shared by all overlapping vouches) and an **aggregate `total_vouch_boost`** per learner. Removal is now `min(boost_amount, current - baseline)`, which is exact and order-independent.
+  - **Missing required test:** added `test_boost_config_change_exact_older_larger_expired_first` and `test_boost_config_change_exact_newer_smaller_expired_first` covering issue acceptance criterion 2 (boost-config change between vouch and expiry keeps accounting exact), in both expiry orderings.
+  - **`expire_vouch` idempotency / doc mismatch:** the TTL check previously preceded the active check, so calling within TTL on a revoked (inactive) record panicked `VouchNotExpired` instead of no-op. Reordered so an already-inactive record returns immediately (no-op) regardless of TTL; the TTL check only applies to still-active records. Added `test_expire_vouch_on_revoked_record_is_noop_within_ttl`.
+  - **`storage.rs` left unchanged:** the aggregate baseline/total helpers now live in `storage.rs` (previously the TTL logic was only in `lib.rs`), satisfying the original files-to-touch note.
+- **Storage changes:** `DataKey` gained `LearnerBaseline(Address)` and `LearnerTotalBoost(Address)`; `VouchRecord.baseline` field removed (no longer needed). `storage.rs` gained `get/set/clear_learner_baseline` and `get/set_total_vouch_boost`.
+- **Verification (revised):** `cargo test -p vouching-contract` → 27 passed, 0 failed (3 new audit-follow-up tests).
+
 ---
 
 ## In Progress
