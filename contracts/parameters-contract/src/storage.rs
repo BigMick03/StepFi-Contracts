@@ -1,4 +1,4 @@
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Symbol, Vec};
 
 use crate::errors::ParametersError;
 use crate::types::{DataKey, MultisigConfig, Proposal, ProtocolParameters};
@@ -10,6 +10,11 @@ pub const VERSION_KEY: Symbol = symbol_short!("VERSION");
 pub const MULTISIG_KEY: Symbol = symbol_short!("MSIG");
 pub const PENDING_MULTISIG_KEY: Symbol = symbol_short!("MSIGPND");
 pub const PROP_CNT_KEY: Symbol = symbol_short!("PROPCNT");
+/// Instance-storage index of proposal ids that are still in flight (not
+/// executed, not invalidated). Bounds the signer-change invalidation scan to
+/// active proposals instead of the full proposal history, which grows forever
+/// and would eventually exceed the Soroban instruction budget.
+pub const ACTIVE_PROPS_KEY: Symbol = symbol_short!("PROPSACT");
 
 // TTL constants (in ledgers — 1 ledger ≈ 5 seconds on mainnet)
 pub const PERSISTENT_TTL_THRESHOLD: u32 = 1_036_800; // 60 days
@@ -125,4 +130,36 @@ pub fn set_proposal(env: &Env, proposal: &Proposal) {
     env.storage()
         .persistent()
         .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+}
+
+/// Removes a stored proposal WITHOUT decoding its value. Used by the
+/// migration helper to clear pre-upgrade proposals whose persisted XDR no
+/// longer matches the current `Proposal` type (reading them would panic).
+pub fn remove_proposal(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Proposal(id));
+}
+
+/// Ids of proposals still in flight (not executed, not invalidated).
+pub fn get_active_proposals(env: &Env) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get(&ACTIVE_PROPS_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_active_proposals(env: &Env, ids: &Vec<u64>) {
+    env.storage().instance().set(&ACTIVE_PROPS_KEY, ids);
+}
+
+/// Removes a single id from the in-flight index (no-op when absent). Called
+/// when a proposal executes.
+pub fn remove_active_proposal(env: &Env, id: u64) {
+    let mut active = get_active_proposals(env);
+    for i in 0..active.len() {
+        if active.get_unchecked(i) == id {
+            active.remove(i);
+            break;
+        }
+    }
+    set_active_proposals(env, &active);
 }

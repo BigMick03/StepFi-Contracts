@@ -88,6 +88,39 @@ impl ParametersContract {
         storage::get_multisig(&env)
     }
 
+    /// Cancels a staged (pending) multisig configuration without activating it
+    /// (admin only). Lets the admin back out of a mistakenly staged request
+    /// instead of being forced to confirm it; a new request can then be staged.
+    pub fn cancel_pending_multisig(env: Env, admin: Address) {
+        admin.require_auth();
+        access::require_admin(&env, &admin);
+
+        if !storage::has_pending_multisig(&env) {
+            panic_with_error!(&env, ParametersError::MultisigNotPending);
+        }
+        Self::enter_non_reentrant(&env);
+        storage::clear_pending_multisig(&env);
+        events::emit_multisig_pending_cancelled(&env, &admin);
+        Self::exit_non_reentrant(&env);
+    }
+
+    /// Migration helper (admin only): removes every stored proposal without
+    /// decoding it and empties the in-flight index. Required after an upgrade
+    /// that changes the `Proposal` XDR layout — pre-upgrade in-flight
+    /// proposals would fail to decode on read, so they must be cleared before
+    /// the multisig is used again, then re-proposed. Safe to call at any time;
+    /// it only deletes proposal records, never the multisig or parameters.
+    pub fn clear_proposals(env: Env, admin: Address) {
+        admin.require_auth();
+        access::require_admin(&env, &admin);
+
+        let count = storage::get_proposal_count(&env);
+        for id in 0..count {
+            storage::remove_proposal(&env, id);
+        }
+        storage::set_active_proposals(&env, &Vec::new(&env));
+    }
+
     pub fn propose(env: Env, proposer: Address, action: ProposalAction) -> u64 {
         proposer.require_auth();
         access::require_signer(&env, &proposer);
@@ -126,6 +159,12 @@ impl ParametersContract {
             invalidated: false,
         };
         storage::set_proposal(&env, &proposal);
+        // Track the proposal in the in-flight index so the signer-change
+        // invalidation scan stays bounded to active proposals (see
+        // `invalidate_signer_proposals`).
+        let mut active = storage::get_active_proposals(&env);
+        active.push_back(id);
+        storage::set_active_proposals(&env, &active);
         events::emit_proposal_created(&env, id, &proposer);
         id
     }
@@ -207,15 +246,20 @@ impl ParametersContract {
         }
 
         Self::enter_non_reentrant(&env);
+        // Persist `executed = true` BEFORE dispatching: the signer-change
+        // invalidation scan that runs inside `do_update_signers` reads
+        // proposals from storage and would otherwise mark this very proposal
+        // invalidated (emitting a spurious PROPINVL for an executed proposal).
+        proposal.executed = true;
+        storage::set_proposal(&env, &proposal);
         match proposal.action.clone() {
             ProposalAction::UpdateParameters(p) => Self::do_update_parameters(&env, &p),
             ProposalAction::SetAdmin(a) => Self::do_set_admin(&env, &a),
             ProposalAction::Upgrade(h) => Self::do_upgrade(&env, h),
             ProposalAction::UpdateSigners(c) => Self::do_update_signers(&env, &c),
         }
-
-        proposal.executed = true;
-        storage::set_proposal(&env, &proposal);
+        // No longer in flight once executed.
+        storage::remove_active_proposal(&env, proposal_id);
         events::emit_proposal_executed(&env, proposal_id);
         Self::exit_non_reentrant(&env);
     }
@@ -273,21 +317,33 @@ impl ParametersContract {
     /// invalidated. Called whenever the signer set changes. Non-signer-targeting
     /// proposals are left alone — they re-validate themselves at execute time
     /// via the eligible-signers snapshot.
+    ///
+    /// Scans only the in-flight index (proposals created since the last
+    /// signer-set change), never the full proposal history, so the cost stays
+    /// bounded as the contract accumulates proposals over time. The index is
+    /// pruned in the same pass: executed, invalidated, expired, and missing
+    /// proposals are dropped.
     fn invalidate_signer_proposals(env: &Env) {
-        let count = storage::get_proposal_count(env);
-        for id in 0..count {
+        let now = env.ledger().timestamp();
+        let active = storage::get_active_proposals(env);
+        let mut remaining = Vec::new(env);
+        for i in 0..active.len() {
+            let id = active.get_unchecked(i);
             let Ok(mut proposal) = storage::get_proposal(env, id) else {
-                continue;
+                continue; // missing — drop from the index
             };
-            if proposal.executed || proposal.invalidated {
-                continue;
+            if proposal.executed || proposal.invalidated || now > proposal.expires_at {
+                continue; // no longer in flight — drop from the index
             }
             if matches!(&proposal.action, ProposalAction::UpdateSigners(_)) {
                 proposal.invalidated = true;
                 storage::set_proposal(env, &proposal);
                 events::emit_proposal_invalidated(env, id);
+            } else {
+                remaining.push_back(id);
             }
         }
+        storage::set_active_proposals(env, &remaining);
     }
 
     /// Quorum required to change the signer set: the current threshold + 1,

@@ -27,6 +27,16 @@ Update this file after every completed contract change, fix, or architectural de
 - **Verification:** `cargo test --workspace` → all 6 crates green (373 tests, 0 failed; parameters-contract 37); `cargo clippy -p parameters-contract -- -D warnings` clean for all changed code (only pre-existing dead-code lints in the untouched `safe_math.rs` remain, same as other contracts); `wasm32-unknown-unknown --release` build succeeds.
 - **Files:** `contracts/parameters-contract/src/lib.rs`, `storage.rs`, `types.rs`, `errors.rs`, `events.rs`, `tests.rs`, plus `contracts/creditline-contract/src/tests.rs` (call-site update)
 
+### Parameters Multisig Hardening — Audit Review Response (PR #95)
+- **Reviewer gaps addressed:**
+  - **Unbounded invalidation scan fixed.** `invalidate_signer_proposals()` previously iterated every proposal id ever created (`0..proposal_count`) on each signer-set change — the scan cost grows with proposal history and would eventually exceed the Soroban instruction budget. The contract now keeps an instance-storage in-flight index (`PROPSACT`) of proposal ids that are not yet executed/invalidated; the scan iterates only that index and prunes executed/invalidated/expired/missing ids in the same pass. `propose()` adds to the index, `execute()` removes from it, `clear_proposals()` empties it.
+  - **Spurious self-invalidation fixed.** `execute()` now persists `executed = true` before dispatching the action, so the invalidation scan that runs inside `do_update_signers` skips the very proposal being executed instead of flagging it invalidated and emitting a misleading `PROPINVL` for it (previously overwritten silently). Regression test `test_executing_signer_proposal_is_not_self_invalidated` asserts no `PROPINVL` references the executed proposal.
+  - **Two-step config cancellation added.** New admin-only `cancel_pending_multisig(admin)` (error `MultisigNotPending = 19` when nothing staged, new `MSIGCNCL` event) lets the admin back out of a mistakenly staged configuration instead of being forced to confirm it — completing the two-step flow's replacement/cancellation path requested by issue #84.
+  - **Concrete migration sequence for the Proposal XDR layout break.** The `Proposal` struct change renders pre-upgrade in-flight proposals undecodable. New admin-only migration helper `clear_proposals(admin)` removes every stored proposal key *without decoding* (removal never decodes) and empties the in-flight index. Documented upgrade sequence: (1) `upgrade()` to the new WASM; (2) run `clear_proposals` once (admin); (3) re-propose any in-flight governance items; (4) resume multisig activity. Until step 2 runs, any read of an old-layout proposal would panic — so the sequence must complete before `approve`/`execute`/signer changes.
+  - **Test coverage closed for issue test items H and J.** Added `test_signer_set_expansion_requires_elevated_quorum` (2-of-3 cannot expand to 4 signers with only 2 approvals) and `test_fully_approved_signer_proposal_invalidated_by_signers_change` (fully approved but not yet executed signer proposal is invalidated by a competing signer change).
+- **Verification:** `cargo test -p parameters-contract` → 45 passed (37 previous + 8 new), 0 failed; `cargo test --workspace` → 381 passed, 0 failed; `cargo clippy -p parameters-contract --tests -- -D warnings` reports only the pre-existing `safe_math.rs` dead-code lints (unchanged).
+- **Files:** `contracts/parameters-contract/src/lib.rs`, `storage.rs`, `events.rs`, `tests.rs`, `context/progress-tracker.md`
+
 ### Issue #58 — Principal-Interest-Fee Repayment Waterfall
 - Added `RepaymentAllocation` struct and `apply_waterfall()` helper in `lib.rs` with correct priority: late fees → interest → service fee → principal
 - Fixed `repay_loan()` to use the corrected waterfall order (was principal-first, now late-fees-first)
@@ -178,7 +188,7 @@ Update this file after every completed contract change, fix, or architectural de
 
 ## Open Questions
 
-- **Proposal layout change on deployed testnet** — the hardened `Proposal` struct added `eligible_signers`/`invalidated` fields, changing its persistent XDR layout. The deployed parameters-contract must be upgraded, and any in-flight proposals from before the upgrade would fail to decode (re-propose them). Is that acceptable, or should the upgrade path clear old proposals first?
+- **Proposal layout change on deployed testnet** — ✅ Resolved: the hardened `Proposal` struct changed its persistent XDR layout, so the deployed parameters-contract must be upgraded and any pre-upgrade in-flight proposals cleared first via the new admin-only `clear_proposals()` migration helper (removes keys without decoding), then re-proposed. See the review-response entry above for the full sequence.
 - What token is used for loans — native XLM or a USDC anchor? (Affects token contract address in `initialize()`)
 - What is the correct `grace_period_seconds` for learner installment loans? (Longer than standard BNPL — possibly 7-14 days per installment)
 - Should sponsor pool deposits go through `liquidity-pool-contract` or a new `sponsor-pool-contract`?

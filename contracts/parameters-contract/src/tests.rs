@@ -498,7 +498,7 @@ fn test_configure_multisig_second_request_rejected_while_pending() {
 #[test]
 #[should_panic(expected = "Error(Contract, #19)")] // MultisigNotPending
 fn test_confirm_multisig_without_pending_fails() {
-    let (env, client, admin) = setup();
+    let (_env, client, admin) = setup();
     client.initialize_defaults(&admin);
     client.confirm_multisig(&admin);
 }
@@ -714,6 +714,205 @@ fn test_configure_multisig_emits_pending_and_confirm_events() {
         }
     }
     assert!(saw_confirm, "MSCONFIG event not found");
+}
+
+// ─── signer-set expansion still needs elevated quorum (issue test H) ───────
+
+#[test]
+fn test_signer_set_expansion_requires_elevated_quorum() {
+    // [A, B, C] → [A, B, C, D]: expanding the committee must NOT be cheaper
+    // than any other signer-set change — 2 approvals are insufficient, 3 are
+    // required (threshold + 1 capped at unanimity).
+    let (env, client, _admin, s1, s2, s3) = setup_multisig();
+
+    let d = Address::generate(&env);
+    let expanded = MultisigConfig {
+        signers: vec![&env, s1.clone(), s2.clone(), s3.clone(), d.clone()],
+        threshold: 2,
+    };
+    let id = client.propose(&s1, &ProposalAction::UpdateSigners(expanded.clone()));
+    client.approve(&s2, &id);
+
+    // Two approvals are below the elevated quorum of 3.
+    assert_eq!(client.try_execute(&id), Err(Ok(contract_error(22))));
+    assert_eq!(client.get_multisig().signers.len(), 3);
+
+    // The third approval reaches it and the expansion installs.
+    client.approve(&s3, &id);
+    client.execute(&id);
+    assert_eq!(client.get_multisig().signers.len(), 4);
+    assert!(client.get_multisig().signers.contains(&d));
+}
+
+// ─── fully approved but not yet executed signer proposals are invalidated ───
+
+#[test]
+fn test_fully_approved_signer_proposal_invalidated_by_signers_change() {
+    // A competing signer-set proposal is FULLY approved (elevated quorum
+    // reached) but not yet executed when another signer-set change goes
+    // through. The old proposal must not stay executable afterwards.
+    let (env, client, _admin, s1, s2, s3) = setup_multisig();
+
+    let stale = client.propose(
+        &s1,
+        &ProposalAction::UpdateSigners(MultisigConfig {
+            signers: vec![&env, s1.clone(), s2.clone()],
+            threshold: 2,
+        }),
+    );
+    // Fully approved: elevated quorum (3) reached, but NOT executed yet.
+    client.approve(&s2, &stale);
+    client.approve(&s3, &stale);
+
+    let winner = client.propose(
+        &s2,
+        &ProposalAction::UpdateSigners(MultisigConfig {
+            signers: vec![&env, s2.clone(), s3.clone()],
+            threshold: 2,
+        }),
+    );
+    client.approve(&s1, &winner);
+    client.approve(&s3, &winner);
+    client.execute(&winner);
+
+    // The fully-approved-but-unexecuted proposal is invalidated, not
+    // executable under the new membership.
+    assert!(client.get_proposal(&stale).invalidated);
+    assert_eq!(client.try_execute(&stale), Err(Ok(contract_error(20))));
+}
+
+// ─── the executing signer proposal is never self-invalidated ────────────────
+
+#[test]
+fn test_executing_signer_proposal_is_not_self_invalidated() {
+    // Regression: the invalidation scan must skip the very proposal being
+    // executed — it must not emit a spurious PROPINVL for it or leave it
+    // flagged invalidated.
+    let (env, client, _admin, s1, s2, s3) = setup_multisig();
+
+    let _stale = client.propose(
+        &s1,
+        &ProposalAction::UpdateSigners(MultisigConfig {
+            signers: vec![&env, s1.clone(), s2.clone()],
+            threshold: 2,
+        }),
+    );
+    let winner = client.propose(
+        &s2,
+        &ProposalAction::UpdateSigners(MultisigConfig {
+            signers: vec![&env, s2.clone(), s3.clone()],
+            threshold: 2,
+        }),
+    );
+    client.approve(&s1, &winner);
+    client.approve(&s3, &winner);
+    client.execute(&winner);
+
+    let winner_proposal = client.get_proposal(&winner);
+    assert!(winner_proposal.executed);
+    assert!(!winner_proposal.invalidated);
+
+    // No PROPINVL event references the executed proposal.
+    let events: soroban_sdk::Vec<(Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> =
+        env.events().all();
+    for e in events.iter() {
+        let topic: soroban_sdk::Symbol = e.1.get_unchecked(0).into_val(&env);
+        if topic == soroban_sdk::symbol_short!("PROPINVL") {
+            let id: u64 = e.2.clone().into_val(&env);
+            assert_ne!(id, winner, "PROPINVL must not reference the executed proposal");
+        }
+    }
+}
+
+// ─── cancellation of a staged multisig configuration ────────────────────────
+
+#[test]
+fn test_cancel_pending_multisig_allows_restaging() {
+    let (env, client, admin) = setup();
+    client.initialize_defaults(&admin);
+
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let signers: Vec<Address> = vec![&env, s1.clone(), s2.clone()];
+
+    // Stage a request, then cancel it before confirming.
+    client.configure_multisig(&admin, &signers, &2u32);
+    client.cancel_pending_multisig(&admin);
+
+    // Nothing was activated.
+    assert_eq!(
+        client.try_get_multisig(),
+        Err(Ok(ParametersError::MultisigNotConfigured))
+    );
+
+    // A corrected request can now be staged and confirmed.
+    let signers2: Vec<Address> = vec![&env, s1.clone(), s2.clone(), Address::generate(&env)];
+    client.configure_multisig(&admin, &signers2, &2u32);
+    client.confirm_multisig(&admin);
+    assert_eq!(client.get_multisig().signers.len(), 3);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")] // MultisigNotPending
+fn test_cancel_pending_multisig_without_pending_fails() {
+    let (_env, client, admin) = setup();
+    client.initialize_defaults(&admin);
+    client.cancel_pending_multisig(&admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // NotAdmin
+fn test_cancel_pending_multisig_by_non_admin_fails() {
+    let (env, client, admin) = setup();
+    client.initialize_defaults(&admin);
+    let intruder = Address::generate(&env);
+
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let signers: Vec<Address> = vec![&env, s1, s2];
+    client.configure_multisig(&admin, &signers, &2u32);
+    client.cancel_pending_multisig(&intruder);
+}
+
+// ─── migration helper: clear undecodable pre-upgrade proposals ──────────────
+
+#[test]
+fn test_clear_proposals_migration_helper() {
+    let (_env, client, _admin, s1, s2, _s3) = setup_multisig();
+
+    let p1 = client.propose(
+        &s1,
+        &ProposalAction::UpdateParameters(default_parameters()),
+    );
+    let p2 = client.propose(&s1, &ProposalAction::UpdateParameters(default_parameters()));
+    client.approve(&s2, &p2);
+
+    // Admin clears all stored proposals (migration path for a Proposal XDR
+    // layout change).
+    let admin = client.get_admin();
+    client.clear_proposals(&admin);
+
+    // All records are gone, the in-flight index is empty, and new proposals
+    // still work.
+    assert_eq!(client.try_get_proposal(&p1), Err(Ok(ParametersError::ProposalNotFound)));
+    assert_eq!(client.try_get_proposal(&p2), Err(Ok(ParametersError::ProposalNotFound)));
+    assert_eq!(client.try_execute(&p1), Err(Ok(contract_error(13)))); // ProposalNotFound
+
+    let p3 = client.propose(
+        &s1,
+        &ProposalAction::UpdateParameters(default_parameters()),
+    );
+    client.approve(&s2, &p3);
+    client.execute(&p3);
+    assert!(client.get_proposal(&p3).executed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // NotAdmin
+fn test_clear_proposals_by_non_admin_fails() {
+    let (env, client, _admin, _s1, _s2, _s3) = setup_multisig();
+    let intruder = Address::generate(&env);
+    client.clear_proposals(&intruder);
 }
 
 #[test]

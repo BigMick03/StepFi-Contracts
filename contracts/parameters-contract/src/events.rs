@@ -6,6 +6,7 @@ const PARAMS_UPDATED: Symbol = symbol_short!("PARMUPDT");
 const ADMIN_UPDATED: Symbol = symbol_short!("PARMADMN");
 const MS_CONFIGURED: Symbol = symbol_short!("MSCONFIG");
 const MSIG_PENDING: Symbol = symbol_short!("MSIGPEND");
+const MSIG_CANCELLED: Symbol = symbol_short!("MSIGCNCL");
 const PROP_CREATED: Symbol = symbol_short!("PROPNEW");
 const PROP_APPROVED: Symbol = symbol_short!("PROPAPPR");
 const PROP_EXECUTED: Symbol = symbol_short!("PROPEXEC");
@@ -57,6 +58,12 @@ pub fn emit_multisig_pending(env: &Env, admin: &Address, config: &MultisigConfig
 /// invalidated because the signer set changed.
 pub fn emit_proposal_invalidated(env: &Env, id: u64) {
     env.events().publish((PROP_INVALIDATED,), id);
+}
+
+/// Emitted when the admin cancels a staged (pending) multisig configuration
+/// without activating it.
+pub fn emit_multisig_pending_cancelled(env: &Env, admin: &Address) {
+    env.events().publish((MSIG_CANCELLED, admin), ());
 }
 
 pub fn emit_proposal_created(env: &Env, id: u64, proposer: &Address) {
