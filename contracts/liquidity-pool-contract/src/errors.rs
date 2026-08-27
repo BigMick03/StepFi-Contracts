@@ -15,8 +15,7 @@ pub enum LiquidityPoolError {
     NotCreditLine = 9,
     ZeroTotalShares = 10,
     ReentrancyDetected = 11,
-    VendorNotActive = 12,
-    VendorNotRegistered = 13,
-    LedgerOutflowCapExceeded = 14,
-    MerchantConcentrationCapExceeded = 15,
+    UpgradeNotProposed = 12,
+    UpgradeTimelockNotMet = 13,
+    UpgradeHashMismatch = 14,
 }

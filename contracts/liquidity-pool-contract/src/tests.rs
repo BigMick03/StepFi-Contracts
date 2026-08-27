@@ -486,7 +486,9 @@ fn test_admin_upgrade_bumps_version() {
         &t.env,
         include_bytes!("../../../contracts/test-fixtures/contract.wasm"),
     ));
-    t.client.upgrade(&wasm_hash);
+    t.client.propose_upgrade(&wasm_hash);
+    t.env.ledger().set_timestamp(86_401);
+    t.client.execute_upgrade(&wasm_hash);
 
     // event observed
     let events: soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> = t.env.events().all();
@@ -2768,341 +2770,98 @@ fn test_absorb_loss_emits_event() {
     assert!(!events.is_empty(), "Expected LQLOSS event to be emitted");
 }
 
-// ─── defense-in-depth: per-ledger outflow cap ────────────────────────────────
-
-#[test]
-fn test_ledger_outflow_cap_bounds_repeated_funding() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    // 25% of 10,000 available = 2,500 per ledger
-    t.client.set_max_outflow_bps(&t.admin, &2500);
-
-    t.client.fund_loan(&t.creditline, &merchant, &2_000);
-    t.client.fund_loan(&t.creditline, &merchant, &500);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 2_500);
-    assert_eq!(stats.available_liquidity, 7_500);
-
-    // Any further funding within the same ledger exceeds the cap
-    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
-    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
-
-    // Rejected attempts must not consume cap headroom or lock liquidity
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 2_500);
-    assert_eq!(stats.available_liquidity, 7_500);
-}
-
-#[test]
-fn test_ledger_outflow_cap_resets_on_new_ledger() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    t.client.set_max_outflow_bps(&t.admin, &2500);
-
-    // First ledger: use the full 2,500 cap, then hit the ceiling
-    t.client.fund_loan(&t.creditline, &merchant, &2_000);
-    t.client.fund_loan(&t.creditline, &merchant, &500);
-    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
-    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
-
-    // New ledger: rolling window resets, full budget available again.
-    // New window snapshots available = 7,500 → budget = 25% = 1,875.
-    t.advance_ledger();
-    t.client.fund_loan(&t.creditline, &merchant, &1_875);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 4_375);
-    assert_eq!(stats.available_liquidity, 5_625);
-
-    // Still capped within the new ledger
-    let res = t.client.try_fund_loan(&t.creditline, &merchant, &1);
-    assert_eq!(res, Err(Ok(LiquidityPoolError::LedgerOutflowCapExceeded)));
-}
-
-#[test]
-fn test_ledger_outflow_cap_defaults_to_disabled() {
-    // Backward compatibility: without explicit configuration the whole
-    // available liquidity can be funded in a single ledger.
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    t.client.fund_loan(&t.creditline, &merchant, &1_000);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 1_000);
-    assert_eq!(stats.available_liquidity, 0);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #4)")]
-fn test_set_max_outflow_bps_above_10000_fails() {
-    let t = TestEnv::setup();
-    t.client.set_max_outflow_bps(&t.admin, &10_001);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #1)")]
-fn test_set_max_outflow_bps_by_non_admin_fails() {
-    let t = TestEnv::setup();
-    let intruder = Address::generate(&t.env);
-    t.client.set_max_outflow_bps(&intruder, &2500);
-}
-
-// ─── defense-in-depth: per-merchant concentration cap ────────────────────────
-
-#[test]
-fn test_merchant_concentration_cap_rejects_excess_funding() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    // Cap cumulative funding per merchant at 3,000
-    t.client.set_max_per_merchant(&t.admin, &3_000);
-
-    t.client.fund_loan(&t.creditline, &merchant, &2_000);
-    t.client.fund_loan(&t.creditline, &merchant, &1_000);
-
-    // Exceeds the 3,000 ceiling
-    let res = t.client.try_fund_loan(&t.creditline, &merchant, &500);
-    assert_eq!(
-        res,
-        Err(Ok(LiquidityPoolError::MerchantConcentrationCapExceeded))
-    );
-
-    // Rejected funding does not lock liquidity
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 3_000);
-}
-
-#[test]
-fn test_merchant_concentration_cap_is_per_merchant() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    t.client.set_max_per_merchant(&t.admin, &3_000);
-
-    let merchant1 = Address::generate(&t.env);
-    let merchant2 = Address::generate(&t.env);
-
-    t.client.fund_loan(&t.creditline, &merchant1, &2_000);
-    t.client.fund_loan(&t.creditline, &merchant2, &3_000);
-
-    // merchant1 still has 1,000 headroom (separate bucket per merchant)
-    t.client.fund_loan(&t.creditline, &merchant1, &1_000);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 6_000);
-}
-
-#[test]
-fn test_merchant_concentration_cap_disabled_by_default() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    // No ceiling configured → concentration is unbounded
-    t.client.fund_loan(&t.creditline, &merchant, &9_000);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 9_000);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #4)")]
-fn test_set_max_per_merchant_negative_fails() {
-    let t = TestEnv::setup();
-    t.client.set_max_per_merchant(&t.admin, &-1);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #1)")]
-fn test_set_max_per_merchant_by_non_admin_fails() {
-    let t = TestEnv::setup();
-    let intruder = Address::generate(&t.env);
-    t.client.set_max_per_merchant(&intruder, &1_000);
-}
-
-// ─── defense-in-depth: optional vendor cross-check ───────────────────────────
-
-#[test]
-fn test_fund_loan_vendor_cross_check_approves_active_merchant() {
-    let t = TestEnv::setup();
-    let registry = t.register_vendor_registry();
-    t.client.set_vendor_registry(&t.admin, &Some(registry.clone()));
-
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    t.register_and_approve_vendor(&registry, &merchant);
-
-    // Honest flow: approved merchant receives funding
-    t.client.fund_loan(&t.creditline, &merchant, &400);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 400);
-}
-
 #[test]
 #[should_panic(expected = "Error(Contract, #12)")]
-fn test_fund_loan_vendor_cross_check_rejects_unregistered_merchant() {
+fn test_upgrade_without_propose_fails() {
     let t = TestEnv::setup();
-    let registry = t.register_vendor_registry();
-    t.client.set_vendor_registry(&t.admin, &Some(registry));
-
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    // merchant was never registered → is_active returns false
-    t.client.fund_loan(&t.creditline, &merchant, &400);
+    let wasm_hash = soroban_sdk::BytesN::from_array(&t.env, &[1u8; 32]);
+    t.client.upgrade(&wasm_hash);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
-fn test_fund_loan_vendor_cross_check_rejects_suspended_merchant() {
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_upgrade_before_timelock_elapses_fails() {
     let t = TestEnv::setup();
-    let registry = t.register_vendor_registry();
-    t.client.set_vendor_registry(&t.admin, &Some(registry.clone()));
-
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    t.register_and_approve_vendor(&registry, &merchant);
-
-    // Suspend the merchant → is_active now returns false
-    let _: Result<(), vendor_registry_contract::VendorRegistryError> = t
-        .env
-        .invoke_contract(
-            &registry,
-            &soroban_sdk::Symbol::new(&t.env, "suspend_vendor"),
-            (&t.admin, &merchant).into_val(&t.env),
-        );
-
-    t.client.fund_loan(&t.creditline, &merchant, &400);
+    let wasm_hash = soroban_sdk::BytesN::from_array(&t.env, &[1u8; 32]);
+    t.client.propose_upgrade(&wasm_hash);
+    t.client.execute_upgrade(&wasm_hash);
 }
 
 #[test]
-fn test_fund_loan_vendor_cross_check_skipped_when_unset() {
-    // Backward compatibility: no registry configured → no validation.
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_upgrade_with_wrong_hash_fails() {
     let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    t.client.fund_loan(&t.creditline, &merchant, &400);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 400);
+    let wasm_hash1 = soroban_sdk::BytesN::from_array(&t.env, &[1u8; 32]);
+    let wasm_hash2 = soroban_sdk::BytesN::from_array(&t.env, &[2u8; 32]);
+    t.client.propose_upgrade(&wasm_hash1);
+    t.env.ledger().set_timestamp(86_401);
+    t.client.execute_upgrade(&wasm_hash2);
 }
 
 #[test]
-fn test_set_vendor_registry_clear_disables_cross_check() {
+fn test_timelocked_upgrade_success_bumps_version() {
     let t = TestEnv::setup();
-    let registry = t.register_vendor_registry();
-    t.client.set_vendor_registry(&t.admin, &Some(registry));
+    assert_eq!(t.client.get_version(), 1);
 
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
+    let wasm_hash = t.env.deployer().upload_contract_wasm(soroban_sdk::Bytes::from_slice(&t.env, include_bytes!("../../../contracts/test-fixtures/contract.wasm")));
+    t.client.propose_upgrade(&wasm_hash);
 
-    // Clear the registry → validation off → unregistered merchant accepted
-    t.client.set_vendor_registry(&t.admin, &None);
-    t.client.fund_loan(&t.creditline, &merchant, &400);
-}
+    // Advance past 1-day timelock delay (86,400 seconds)
+    t.env.ledger().set_timestamp(86_401);
+    t.client.execute_upgrade(&wasm_hash);
 
-#[test]
-#[should_panic(expected = "Error(Contract, #1)")]
-fn test_set_vendor_registry_by_non_admin_fails() {
-    let t = TestEnv::setup();
-    let intruder = Address::generate(&t.env);
-    let registry = t.register_vendor_registry();
-    t.client.set_vendor_registry(&intruder, &Some(registry));
-}
-
-#[test]
-fn test_set_vendor_registry_roundtrip_affects_funding() {
-    // Admin can set and clear the registry; behavior follows each state.
-    let t = TestEnv::setup();
-    let registry = t.register_vendor_registry();
-
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 1_000);
-    t.client.deposit(&provider, &1_000);
-
-    // With the registry set, an unregistered merchant is rejected
-    t.client.set_vendor_registry(&t.admin, &Some(registry));
-    let res = t.client.try_fund_loan(&t.creditline, &merchant, &400);
-    assert_eq!(res, Err(Ok(LiquidityPoolError::VendorNotActive)));
-
-    // Clearing the registry restores the unvalidated (legacy) behavior
-    t.client.set_vendor_registry(&t.admin, &None);
-    t.client.fund_loan(&t.creditline, &merchant, &400);
-
-    let stats = t.client.get_pool_stats();
-    assert_eq!(stats.locked_liquidity, 400);
-}
-
-// ─── defense-in-depth: granular LQFUND event payload ─────────────────────────
-
-#[test]
-fn test_fund_loan_event_includes_merchant_and_remaining_caps() {
-    let t = TestEnv::setup();
-    let provider = Address::generate(&t.env);
-    let merchant = Address::generate(&t.env);
-    t.mint(&provider, 10_000);
-    t.client.deposit(&provider, &10_000);
-
-    t.client.set_max_outflow_bps(&t.admin, &2500);
-    t.client.set_max_per_merchant(&t.admin, &5_000);
-
-    t.client.fund_loan(&t.creditline, &merchant, &1_000);
-
-    let events = t.env.events().all();
-    let mut found = false;
+    let events: soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> = t.env.events().all();
+    let mut upgraded_new: Option<u32> = None;
     for e in events.iter() {
         let topic: soroban_sdk::Symbol = e.1.get_unchecked(0).into_val(&t.env);
-        if topic == soroban_sdk::Symbol::new(&t.env, "LQFUND") {
-            // topics = (LQFUND, creditline, merchant)
-            let topic_creditline: Address = e.1.get_unchecked(1).into_val(&t.env);
-            let topic_merchant: Address = e.1.get_unchecked(2).into_val(&t.env);
-            assert_eq!(topic_creditline, t.creditline);
-            assert_eq!(topic_merchant, merchant);
-
-            // data = (amount, remaining_ledger_cap, remaining_merchant_cap)
-            let (amount, remaining_ledger_cap, remaining_merchant_cap): (i128, i128, i128) =
-                e.2.clone().try_into_val(&t.env).unwrap();
-            assert_eq!(amount, 1_000);
-            assert_eq!(remaining_ledger_cap, 1_500); // 2,500 cap − 1,000 funded
-            assert_eq!(remaining_merchant_cap, 4_000); // 5,000 cap − 1,000 funded
-            found = true;
+        if topic == soroban_sdk::Symbol::new(&t.env, "CONTRACTUPGRADED") {
+            let (_old, new_v, _ts): (u32, u32, u64) = e.2.into_val(&t.env);
+            upgraded_new = Some(new_v);
             break;
         }
     }
-    assert!(found, "LQFUND event not found");
+    assert_eq!(upgraded_new, Some(2u32));
+}
+
+#[soroban_sdk::contract]
+pub struct MockParametersContract;
+
+#[soroban_sdk::contractimpl]
+impl MockParametersContract {
+    pub fn get_parameters(_env: Env) -> crate::types::ProtocolParameters {
+        crate::types::ProtocolParameters {
+            min_guarantee_percent: 20,
+            min_reputation_threshold: 50,
+            full_repayment_reward: 10,
+            default_penalty: 20,
+            large_loan_threshold: 5000,
+            large_loan_default_penalty: 30,
+            base_interest_bps: 0,
+            grace_period_seconds: 0,
+            upgrade_delay_seconds: 172_800, // 2 days (172,800 seconds)
+        }
+    }
+}
+
+#[test]
+fn test_upgrade_delay_parameterized_via_parameters_contract() {
+    let t = TestEnv::setup();
+    let params_id = t.env.register(MockParametersContract, ());
+    t.client.set_parameters_contract(&params_id);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&t.env, &[7u8; 32]);
+    t.client.propose_upgrade(&wasm_hash);
+
+    // At 86,401s (1 day), execute_upgrade fails because custom delay is 172,800s
+    t.env.ledger().set_timestamp(86_401);
+    let res = t.client.try_execute_upgrade(&wasm_hash);
+    let expected_err = soroban_sdk::Error::from_contract_error(LiquidityPoolError::UpgradeTimelockNotMet as u32);
+    assert_eq!(res, Err(Ok(expected_err)));
+
+    // Advance past custom 2-day delay (172,801s)
+    t.env.ledger().set_timestamp(172_801);
+    let wasm_real = t.env.deployer().upload_contract_wasm(soroban_sdk::Bytes::from_slice(&t.env, include_bytes!("../../../contracts/test-fixtures/contract.wasm")));
+    t.client.propose_upgrade(&wasm_real);
+    t.env.ledger().set_timestamp(172_801 + 172_801);
+    t.client.execute_upgrade(&wasm_real);
 }
